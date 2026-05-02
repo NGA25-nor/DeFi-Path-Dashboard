@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import http.server
 import json
+import socketserver
 import sys
+import threading
 import webbrowser
 from datetime import datetime
 from html import escape
@@ -10,22 +13,24 @@ from typing import Any
 
 import requests
 
+from config import LP_WALLET, MAIN_WALLET
 from db import get_history, init_db, insert_snapshot
 
 
-# --- USER CONFIGURATION ---
-MAIN_WALLET = "0x0C4bE1AC7edf172E0F617548F2a3e76561DEbc2E"  # AAVE collateral & debt
-LP_WALLET = "x0C4bE1AC7edf172E0F617548F2a3e76561DEbc2E"  # Uniswap V3 LP positions
 RPC_URL = "https://ethereum-rpc.publicnode.com"
-# --------------------------
+SERVER_HOST = "localhost"
+SERVER_PORTS = (5050, 5051, 5052)
 
 
 AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
 AWETH = "0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8"
+AWBTC = "0x5Ee5bf7ae06D1Be5997A1A72006FE6C607eC6DE8"
 VDUSDT = "0x531842cebfcce26401911cb6d3b170f8b2fc57c6"
 UNI_V3_NFT_MANAGER = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
 ETH_USD_FEED = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
 BTC_USD_FEED = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
+ETH_LIQ_THRESHOLD = 0.825
+BTC_LIQ_THRESHOLD = 0.750
 
 LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 BALANCE_OF_SELECTOR = "0x70a08231"
@@ -137,6 +142,18 @@ def number(value: float | int | None, digits: int = 2) -> str:
     return f"{value:,.{digits}f}"
 
 
+def percent(value: float | None, digits: int = 1) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:,.{digits}f}%"
+
+
+def signed_drop(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"-{number(value, 1)}%"
+
+
 def truncated(address: str) -> str:
     if not isinstance(address, str) or len(address) < 12:
         return address
@@ -153,16 +170,60 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
     eth_main = raw.get("eth_main")
     eth_lp = raw.get("eth_lp")
     eth_price = raw.get("eth_price")
+    btc_price = raw.get("btc_price")
+    aweth_balance = raw.get("aweth_balance")
+    awbtc_balance = raw.get("awbtc_balance")
 
     aave_equity = collateral - debt if collateral is not None and debt is not None else None
     ltv_pct = (debt / collateral) * 100 if collateral and debt is not None else None
     eth_equity = (eth_main + eth_lp) * eth_price if None not in (eth_main, eth_lp, eth_price) else None
     total_equity = aave_equity + eth_equity if aave_equity is not None and eth_equity is not None else None
+    btc_collateral_usd = awbtc_balance * btc_price if None not in (awbtc_balance, btc_price) else None
+    liq_price_eth = None
+    liq_price_btc = None
+    correlated_liq_drop_pct = None
+    correlated_liq_price_eth = None
+    correlated_liq_price_btc = None
+
+    if (
+        debt is not None
+        and btc_collateral_usd is not None
+        and aweth_balance is not None
+        and aweth_balance > 0
+    ):
+        liq_price_eth = (debt - btc_collateral_usd * BTC_LIQ_THRESHOLD) / (
+            aweth_balance * ETH_LIQ_THRESHOLD
+        )
+        if liq_price_eth <= 0:
+            liq_price_eth = None
+
+    if (
+        debt is not None
+        and eth_price is not None
+        and aweth_balance is not None
+        and awbtc_balance is not None
+        and awbtc_balance > 0
+    ):
+        liq_price_btc = (debt - aweth_balance * eth_price * ETH_LIQ_THRESHOLD) / (
+            awbtc_balance * BTC_LIQ_THRESHOLD
+        )
+        if liq_price_btc <= 0:
+            liq_price_btc = None
+
+    if None not in (debt, aweth_balance, eth_price, awbtc_balance, btc_price):
+        weighted_collateral = (
+            aweth_balance * eth_price * ETH_LIQ_THRESHOLD
+            + awbtc_balance * btc_price * BTC_LIQ_THRESHOLD
+        )
+        if weighted_collateral > debt:
+            correlated_liq_drop_pct = (1 - debt / weighted_collateral) * 100
+            correlated_liq_price_eth = eth_price * (1 - correlated_liq_drop_pct / 100)
+            correlated_liq_price_btc = btc_price * (1 - correlated_liq_drop_pct / 100)
 
     return {
         "timestamp": timestamp,
         "eth_price": eth_price,
-        "btc_price": raw.get("btc_price"),
+        "btc_price": btc_price,
         "eth_main": eth_main,
         "eth_lp": eth_lp,
         "aave_collateral": collateral,
@@ -170,9 +231,15 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
         "aave_equity": aave_equity,
         "health_factor": raw.get("health_factor"),
         "ltv_pct": ltv_pct,
-        "aweth_balance": raw.get("aweth_balance"),
+        "aweth_balance": aweth_balance,
+        "awbtc_balance": awbtc_balance,
         "vdusdt_balance": raw.get("vdusdt_balance"),
         "uni_positions": raw.get("uni_positions"),
+        "liq_price_eth": liq_price_eth,
+        "liq_price_btc": liq_price_btc,
+        "correlated_liq_drop_pct": correlated_liq_drop_pct,
+        "correlated_liq_price_eth": correlated_liq_price_eth,
+        "correlated_liq_price_btc": correlated_liq_price_btc,
         "total_equity": total_equity,
         "notes": raw.get("notes"),
     }
@@ -188,11 +255,40 @@ def health_class(health_factor: float | None) -> str:
     return "red"
 
 
+def liquidation_buffer(current_price: float | None, liquidation_price: float | None) -> float | None:
+    if current_price is None or liquidation_price is None or current_price <= 0:
+        return None
+    return ((current_price - liquidation_price) / current_price) * 100
+
+
+def liquidation_risk_class(*buffers: float | None) -> str:
+    known_buffers = [buffer for buffer in buffers if buffer is not None]
+    if not known_buffers:
+        return "green"
+    if any(buffer < 15 for buffer in known_buffers):
+        return "red"
+    if any(buffer <= 30 for buffer in known_buffers):
+        return "amber"
+    return "green"
+
+
+def market_drop_class(drop_pct: float | None) -> str:
+    if drop_pct is None:
+        return "muted"
+    if drop_pct < 20:
+        return "red"
+    if drop_pct <= 35:
+        return "amber"
+    return "green"
+
+
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
     labels = [row["timestamp"][:10] for row in history]
     total_equity = [row.get("total_equity") for row in history]
     health_factors = [row.get("health_factor") for row in history]
     ltv_values = [row.get("ltv_pct") for row in history]
+    eth_prices = [row.get("eth_price") for row in history]
+    eth_liq_prices = [row.get("liq_price_eth") for row in history]
     health_colors = [
         "#34d399" if value is not None and value >= 1.5 else "#fbbf24" if value is not None and value >= 1.2 else "#f87171"
         for value in health_factors
@@ -209,6 +305,11 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     uni_positions = snapshot.get("uni_positions")
     uni_text = f"{uni_positions} active positions" if uni_positions else "No positions found"
     uni_class = "green" if uni_positions else "muted"
+    eth_buffer = liquidation_buffer(snapshot.get("eth_price"), snapshot.get("liq_price_eth"))
+    btc_buffer = liquidation_buffer(snapshot.get("btc_price"), snapshot.get("liq_price_btc"))
+    risk_class = liquidation_risk_class(eth_buffer, btc_buffer)
+    market_drop_color = market_drop_class(snapshot.get("correlated_liq_drop_pct"))
+    liquidation_equity_threshold = snapshot.get("aave_debt")
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -239,7 +340,33 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       line-height: 1.5;
     }}
     main {{ width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0; }}
-    header {{ margin-bottom: 24px; }}
+    header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 24px; }}
+    .refresh-btn {{
+      background: #262a33;
+      color: #e5e7eb;
+      border: 1px solid #34d399;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      padding: 10px 14px;
+      transition: background 120ms ease, color 120ms ease;
+      white-space: nowrap;
+    }}
+    .refresh-btn:hover:not(:disabled) {{ background: #34d399; color: #0f1115; }}
+    .refresh-btn:disabled {{ cursor: wait; opacity: 0.75; }}
+    .toast {{
+      position: fixed;
+      right: 18px;
+      top: 18px;
+      display: none;
+      background: #1a1d24;
+      border: 1px solid #f87171;
+      border-radius: 8px;
+      color: #e5e7eb;
+      padding: 12px 14px;
+      z-index: 10;
+    }}
     h1 {{ margin: 0 0 6px; font-size: 32px; font-weight: 750; }}
     h2 {{ margin: 0 0 14px; font-size: 18px; }}
     .subtitle, .muted {{ color: var(--muted); }}
@@ -259,6 +386,14 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .banner.green {{ border-left-color: var(--green); }}
     .banner.amber {{ border-left-color: var(--amber); }}
     .banner.red {{ border-left-color: var(--red); }}
+    .risk-box {{
+      margin-bottom: 20px;
+      border-left: 5px solid var(--green);
+    }}
+    .risk-box.amber {{ border-left-color: var(--amber); }}
+    .risk-box.red {{ border-left-color: var(--red); }}
+    .risk-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 22px; }}
+    .risk-status {{ margin-top: 14px; font-weight: 720; }}
     .label {{ color: var(--muted); font-size: 13px; }}
     .value {{ margin-top: 4px; font-size: 24px; font-weight: 720; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
@@ -278,6 +413,8 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     @media (max-width: 820px) {{
       main {{ width: min(100% - 20px, 1180px); padding: 20px 0; }}
       .grid, .banner, .two-col {{ grid-template-columns: 1fr; }}
+      header {{ display: block; }}
+      .refresh-btn {{ margin-top: 12px; }}
       h1 {{ font-size: 26px; }}
       .chart-wrap {{ height: 280px; }}
     }}
@@ -286,9 +423,13 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
 <body>
   <main>
     <header>
-      <h1>DeFi Portfolio Tracker</h1>
-      <div class="subtitle">{escape(snapshot["timestamp"])} | MAIN {escape(truncated(MAIN_WALLET))} | LP {escape(truncated(LP_WALLET))}</div>
+      <div>
+        <h1>DeFi Portfolio Tracker</h1>
+        <div class="subtitle">{escape(snapshot["timestamp"])} | MAIN {escape(truncated(MAIN_WALLET))} | LP {escape(truncated(LP_WALLET))}</div>
+      </div>
+      <button class="refresh-btn" onclick="refreshData()">&#10227; Refresh</button>
     </header>
+    <div class="toast" id="toast">Start tracker.py in Terminal first</div>
 
     <section class="card banner {banner_class}">
       <div><div class="label">Health Factor</div><div class="value">{number(hf, 3)}</div></div>
@@ -305,12 +446,32 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">AAVE Debt</div><div class="value">{money(snapshot.get("aave_debt"))}</div></div>
       <div class="card kpi"><div class="label">aWETH Balance</div><div class="value">{number(snapshot.get("aweth_balance"), 6)}</div></div>
       <div class="card kpi"><div class="label">vdUSDT Balance</div><div class="value">{number(snapshot.get("vdusdt_balance"), 2)}</div></div>
+      <div class="card kpi"><div class="label">Liq Price ETH</div><div class="value red">{money(snapshot.get("liq_price_eth"))}</div></div>
+      <div class="card kpi"><div class="label">Liq Price BTC</div><div class="value red">{money(snapshot.get("liq_price_btc"))}</div></div>
+      <div class="card kpi"><div class="label">aWBTC Balance</div><div class="value">{number(snapshot.get("awbtc_balance"), 8)} BTC</div></div>
+      <div class="card kpi"><div class="label">Distance to Liq ETH%</div><div class="value amber">{percent(eth_buffer)}</div></div>
+      <div class="card kpi"><div class="label">Market Drop to Liq</div><div class="value {market_drop_color}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div></div>
+    </section>
+
+    <section class="card risk-box {risk_class}">
+      <h2>LIQUIDATION RISK SUMMARY</h2>
+      <div class="risk-grid">
+        <div><span class="label">ETH liq price:</span> <strong>{money(snapshot.get("liq_price_eth"))}</strong> <span class="muted">({percent(eth_buffer)} buffer)</span></div>
+        <div><span class="label">BTC liq price:</span> <strong>{money(snapshot.get("liq_price_btc"))}</strong> <span class="muted">({percent(btc_buffer)} buffer)</span></div>
+        <div><span class="label">Current ETH:</span> <strong>{money(snapshot.get("eth_price"))}</strong></div>
+        <div><span class="label">Current BTC:</span> <strong>{money(snapshot.get("btc_price"))}</strong></div>
+        <div><span class="label">Correlated drop to liquidation:</span> <strong>{signed_drop(snapshot.get("correlated_liq_drop_pct"))}</strong></div>
+        <div><span class="label">ETH price at liquidation:</span> <strong>{money(snapshot.get("correlated_liq_price_eth"))}</strong></div>
+        <div><span class="label">BTC price at liquidation:</span> <strong>{money(snapshot.get("correlated_liq_price_btc"))}</strong></div>
+      </div>
+      <div class="risk-status {risk_class}">{risk_class.upper()}</div>
     </section>
 
     <section class="charts">
       <div class="card"><h2>30-day Total Equity trend</h2><div class="chart-wrap"><canvas id="equityChart"></canvas></div></div>
       <div class="card"><h2>AAVE Health Factor over time</h2><div class="chart-wrap"><canvas id="hfChart"></canvas></div></div>
       <div class="card"><h2>LTV% over time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
+      <div class="card"><h2>ETH Price vs Liquidation Level</h2><div class="chart-wrap"><canvas id="ethLiqChart"></canvas></div></div>
     </section>
 
     <section class="two-col">
@@ -334,11 +495,31 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
   </main>
 
   <script>
+    async function refreshData() {{
+      const btn = document.querySelector(".refresh-btn");
+      const toast = document.getElementById("toast");
+      btn.textContent = "Fetching...";
+      btn.disabled = true;
+      try {{
+        const response = await fetch("/refresh");
+        if (!response.ok) throw new Error("refresh failed");
+        window.location.reload();
+      }} catch (error) {{
+        toast.style.display = "block";
+        setTimeout(() => {{ toast.style.display = "none"; }}, 3500);
+        btn.textContent = "Refresh";
+        btn.disabled = false;
+      }}
+    }}
+
     const labels = {js_json(labels)};
     const equity = {js_json(total_equity)};
     const healthFactors = {js_json(health_factors)};
     const healthColors = {js_json(health_colors)};
     const ltvValues = {js_json(ltv_values)};
+    const ethPrices = {js_json(eth_prices)};
+    const ethLiqPrices = {js_json(eth_liq_prices)};
+    const liquidationEquityThreshold = {js_json(liquidation_equity_threshold)};
 
     const gridColor = "#262a33";
     const textColor = "#9ca3af";
@@ -347,11 +528,11 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       return "$" + (value / 1000).toFixed(0) + "k";
     }};
 
-    const linePlugin = (id, yValue, color) => ({{
+    const linePlugin = (id, yValue, color, label) => ({{
       id,
       afterDatasetsDraw(chart) {{
         const {{ctx, chartArea, scales}} = chart;
-        if (!chartArea || !scales.y) return;
+        if (!chartArea || !scales.y || yValue === null) return;
         const y = scales.y.getPixelForValue(yValue);
         ctx.save();
         ctx.strokeStyle = color;
@@ -360,6 +541,12 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         ctx.moveTo(chartArea.left, y);
         ctx.lineTo(chartArea.right, y);
         ctx.stroke();
+        if (label) {{
+          ctx.setLineDash([]);
+          ctx.fillStyle = color;
+          ctx.font = "12px sans-serif";
+          ctx.fillText(label, chartArea.left + 8, y - 6);
+        }}
         ctx.restore();
       }}
     }});
@@ -377,7 +564,8 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     new Chart(document.getElementById("equityChart"), {{
       type: "line",
       data: {{ labels, datasets: [{{ data: equity, borderColor: "#a5b4fc", backgroundColor: "rgba(165, 180, 252, 0.15)", tension: 0.25, spanGaps: true }}] }},
-      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: moneyTick }} }} }} }}
+      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: moneyTick }} }} }} }},
+      plugins: [linePlugin("equityLiqThreshold", liquidationEquityThreshold, "#f87171", "Liq threshold")]
     }});
 
     new Chart(document.getElementById("hfChart"), {{
@@ -392,6 +580,22 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       data: {{ labels, datasets: [{{ data: ltvValues, backgroundColor: "#fbbf24" }}] }},
       options: commonOptions,
       plugins: [linePlugin("ltvWarning", 80, "#f87171")]
+    }});
+
+    new Chart(document.getElementById("ethLiqChart"), {{
+      type: "line",
+      data: {{
+        labels,
+        datasets: [
+          {{ label: "ETH price", data: ethPrices, borderColor: "#a5b4fc", tension: 0.25, spanGaps: true }},
+          {{ label: "ETH liq price", data: ethLiqPrices, borderColor: "#f87171", borderDash: [6, 6], tension: 0.25, spanGaps: true }}
+        ]
+      }},
+      options: {{
+        ...commonOptions,
+        plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
+        scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: value => "$" + Number(value).toLocaleString() }} }} }}
+      }}
     }});
   </script>
 </body>
@@ -410,6 +614,7 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         ("MAIN ETH balance", "eth_main", lambda: fetch_eth_balance(MAIN_WALLET)),
         ("LP ETH balance", "eth_lp", lambda: fetch_eth_balance(LP_WALLET)),
         ("aWETH balance", "aweth_balance", lambda: fetch_token_balance(AWETH, MAIN_WALLET, 18)),
+        ("aWBTC balance", "awbtc_balance", lambda: fetch_token_balance(AWBTC, MAIN_WALLET, 8)),
         ("vdUSDT balance", "vdusdt_balance", lambda: fetch_token_balance(VDUSDT, MAIN_WALLET, 6)),
         ("Uniswap V3 position count", "uni_positions", lambda: fetch_uni_position_count(LP_WALLET)),
     ]
@@ -429,7 +634,7 @@ def fetch_all() -> tuple[dict[str, Any], int]:
     return raw, successes
 
 
-def main() -> int:
+def run_data_fetch() -> bool:
     print("Fetching on-chain data...")
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -438,19 +643,23 @@ def main() -> int:
     except ValueError as exc:
         print(f"Error: {exc}")
         print("Replace MAIN_WALLET and LP_WALLET in tracker.py before first run.")
-        return 1
+        return False
 
     if successes == 0:
         print("Error: all RPC calls failed. No database row written.")
-        return 1
+        return False
 
     snapshot = compute_snapshot(raw, timestamp)
-    print(
-        "Summary: "
-        f"ETH price {money(snapshot.get('eth_price'))}, "
-        f"HF {number(snapshot.get('health_factor'), 3)}, "
-        f"equity {money(snapshot.get('total_equity'))}"
-    )
+    eth_buffer = liquidation_buffer(snapshot.get("eth_price"), snapshot.get("liq_price_eth"))
+    btc_buffer = liquidation_buffer(snapshot.get("btc_price"), snapshot.get("liq_price_btc"))
+    print(f"ETH price:        {money(snapshot.get('eth_price'))}")
+    print(f"ETH liq price:    {money(snapshot.get('liq_price_eth'))}  ({percent(eth_buffer)} buffer)")
+    print(f"BTC price:        {money(snapshot.get('btc_price'))}")
+    print(f"BTC liq price:    {money(snapshot.get('liq_price_btc'))}  ({percent(btc_buffer)} buffer)")
+    print(f"Correlated liq drop:  {signed_drop(snapshot.get('correlated_liq_drop_pct'))}  (both assets fall together)")
+    print(f"ETH at liq:           {money(snapshot.get('correlated_liq_price_eth'))}")
+    print(f"BTC at liq:           {money(snapshot.get('correlated_liq_price_btc'))}")
+    print(f"Health Factor:    {number(snapshot.get('health_factor'), 2)}")
 
     init_db()
     insert_snapshot(snapshot)
@@ -458,7 +667,65 @@ def main() -> int:
     generate_dashboard(snapshot, history)
 
     print("Dashboard generated: dashboard.html")
-    webbrowser.open(DASHBOARD_PATH.resolve().as_uri())
+    return True
+
+
+class RefreshHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/refresh":
+            ok = run_data_fetch()
+            self.send_response(200 if ok else 500)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK" if ok else b"ERROR")
+        elif self.path in ("/", "/dashboard"):
+            content = DASHBOARD_PATH.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(content)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def start_server() -> tuple[socketserver.TCPServer, int]:
+    socketserver.TCPServer.allow_reuse_address = True
+    last_error = None
+    for port in SERVER_PORTS:
+        try:
+            return socketserver.TCPServer((SERVER_HOST, port), RefreshHandler), port
+        except OSError as exc:
+            last_error = exc
+    raise OSError(f"could not bind localhost ports {SERVER_PORTS}: {last_error}")
+
+
+def main() -> int:
+    if not run_data_fetch():
+        return 1
+
+    try:
+        server, port = start_server()
+    except OSError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    url = f"http://{SERVER_HOST}:{port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Serving dashboard: {url}")
+    webbrowser.open(url)
+
+    try:
+        while True:
+            thread.join(1)
+    except KeyboardInterrupt:
+        print("\nStopping dashboard server.")
+        server.shutdown()
+        server.server_close()
     return 0
 
 

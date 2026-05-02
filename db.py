@@ -24,12 +24,29 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
     health_factor   REAL,
     ltv_pct         REAL,
     aweth_balance   REAL,
+    awbtc_balance   REAL,
     vdusdt_balance  REAL,
     uni_positions   INTEGER,
+    liq_price_eth   REAL,
+    liq_price_btc   REAL,
+    correlated_liq_drop_pct  REAL,
+    correlated_liq_price_eth REAL,
+    correlated_liq_price_btc REAL,
     total_equity    REAL,
     notes           TEXT
 );
 """
+
+
+MIGRATIONS = (
+    ("btc_price", "REAL"),
+    ("awbtc_balance", "REAL"),
+    ("liq_price_eth", "REAL"),
+    ("liq_price_btc", "REAL"),
+    ("correlated_liq_drop_pct", "REAL"),
+    ("correlated_liq_price_eth", "REAL"),
+    ("correlated_liq_price_btc", "REAL"),
+)
 
 
 COLUMNS = (
@@ -44,8 +61,14 @@ COLUMNS = (
     "health_factor",
     "ltv_pct",
     "aweth_balance",
+    "awbtc_balance",
     "vdusdt_balance",
     "uni_positions",
+    "liq_price_eth",
+    "liq_price_btc",
+    "correlated_liq_drop_pct",
+    "correlated_liq_price_eth",
+    "correlated_liq_price_btc",
     "total_equity",
     "notes",
 )
@@ -56,6 +79,12 @@ def init_db(db_path: Path = DB_PATH) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.execute(SCHEMA)
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(daily_snapshots)")
+        }
+        for column, column_type in MIGRATIONS:
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE daily_snapshots ADD COLUMN {column} {column_type}")
         conn.commit()
 
 
