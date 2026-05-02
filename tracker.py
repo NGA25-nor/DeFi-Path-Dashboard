@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import math
 import socketserver
 import sys
 import threading
@@ -27,6 +28,9 @@ AWETH = "0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8"
 AWBTC = "0x5Ee5bf7ae06D1Be5997A1A72006FE6C607eC6DE8"
 VDUSDT = "0x531842cebfcce26401911cb6d3b170f8b2fc57c6"
 UNI_V3_NFT_MANAGER = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
+UNI_WETH_USDT_POOL = "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"
+WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
 ETH_USD_FEED = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
 BTC_USD_FEED = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
 ETH_LIQ_THRESHOLD = 0.825
@@ -35,6 +39,10 @@ BTC_LIQ_THRESHOLD = 0.750
 LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 BALANCE_OF_SELECTOR = "0x70a08231"
 AAVE_USER_DATA_SELECTOR = "0xbf92857c"
+TOKEN_OF_OWNER_BY_INDEX_SELECTOR = "0x2f745c59"
+POSITIONS_SELECTOR = "0x99fbab88"
+SLOT0_SELECTOR = "0x3850c7bd"
+Q96 = 2**96
 
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_PATH = BASE_DIR / "dashboard.html"
@@ -72,6 +80,20 @@ def hex_to_int(value: str) -> int:
     if not value or value == "0x":
         return 0
     return int(value, 16)
+
+
+def pad_uint(value: int) -> str:
+    return hex(value)[2:].rjust(64, "0")
+
+
+def decode_address_word(word: int) -> str:
+    return "0x" + hex(word)[2:].rjust(64, "0")[-40:]
+
+
+def decode_signed_word(word: int) -> int:
+    if word >= 2**255:
+        return word - 2**256
+    return word
 
 
 def eth_call(to_address: str, data: str) -> str:
@@ -130,6 +152,164 @@ def fetch_uni_position_count(wallet: str) -> int:
     return hex_to_int(result)
 
 
+def fetch_uni_token_ids(wallet: str, count: int) -> list[int]:
+    token_ids = []
+    for index in range(count):
+        result = eth_call(
+            UNI_V3_NFT_MANAGER,
+            TOKEN_OF_OWNER_BY_INDEX_SELECTOR + pad_address(wallet) + pad_uint(index),
+        )
+        token_ids.append(hex_to_int(result))
+    return token_ids
+
+
+def fetch_uni_position(token_id: int) -> dict[str, Any]:
+    result = eth_call(UNI_V3_NFT_MANAGER, POSITIONS_SELECTOR + pad_uint(token_id))
+    words = decode_uint_words(result)
+    if len(words) < 12:
+        raise RpcError("positions() returned too few fields")
+    return {
+        "token_id": token_id,
+        "token0": decode_address_word(words[2]),
+        "token1": decode_address_word(words[3]),
+        "fee": words[4],
+        "tick_lower": decode_signed_word(words[5]),
+        "tick_upper": decode_signed_word(words[6]),
+        "liquidity": words[7],
+        "tokens_owed0": words[10],
+        "tokens_owed1": words[11],
+    }
+
+
+def fetch_weth_usdt_slot0() -> dict[str, int]:
+    result = eth_call(UNI_WETH_USDT_POOL, SLOT0_SELECTOR)
+    words = decode_uint_words(result)
+    if len(words) < 2:
+        raise RpcError("slot0() returned too few fields")
+    return {"sqrt_price_x96": words[0], "tick": decode_signed_word(words[1])}
+
+
+def tick_to_sqrt_price(tick: int) -> float:
+    return math.sqrt(1.0001**tick) * Q96
+
+
+def tick_to_price(tick: int, token0_decimals: int = 18, token1_decimals: int = 6) -> float:
+    raw_price = 1.0001**tick
+    return raw_price * (10**token0_decimals) / (10**token1_decimals)
+
+
+def get_uni_amounts(
+    liquidity: int,
+    sqrt_price_x96: int,
+    tick_lower: int,
+    tick_upper: int,
+    current_tick: int,
+) -> tuple[float, float]:
+    sqrt_price = sqrt_price_x96 / Q96
+    sqrt_lower = tick_to_sqrt_price(tick_lower) / Q96
+    sqrt_upper = tick_to_sqrt_price(tick_upper) / Q96
+
+    if current_tick < tick_lower:
+        amount0 = liquidity * (1 / sqrt_lower - 1 / sqrt_upper)
+        amount1 = 0
+    elif current_tick >= tick_upper:
+        amount0 = 0
+        amount1 = liquidity * (sqrt_upper - sqrt_lower)
+    else:
+        amount0 = liquidity * (1 / sqrt_price - 1 / sqrt_upper)
+        amount1 = liquidity * (sqrt_price - sqrt_lower)
+
+    return max(amount0, 0), max(amount1, 0)
+
+
+def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str, Any]:
+    count = fetch_uni_position_count(wallet)
+    if count <= 0:
+        return {
+            "uni_positions": 0,
+            "uni_position_ids": None,
+            "uni_position_value": None,
+            "uni_fees_unclaimed": None,
+            "uni_weth_amount": None,
+            "uni_usdt_amount": None,
+            "uni_in_range": None,
+            "uni_tick_lower": None,
+            "uni_tick_upper": None,
+            "uni_current_tick": None,
+        }
+
+    token_ids = fetch_uni_token_ids(wallet, count)
+    slot0 = fetch_weth_usdt_slot0()
+    total_value = 0.0
+    total_fees = 0.0
+    total_weth = 0.0
+    total_usdt = 0.0
+    in_range_values = []
+    tick_lowers = []
+    tick_uppers = []
+    active_ids = []
+    closed_ids = []
+    valued_any = False
+
+    for token_id in token_ids:
+        position = fetch_uni_position(token_id)
+        liquidity = position["liquidity"]
+        if liquidity == 0:
+            closed_ids.append(token_id)
+            continue
+
+        token0 = position["token0"].lower()
+        token1 = position["token1"].lower()
+        if token0 != WETH.lower() or token1 != USDT.lower() or position["fee"] != 3000:
+            print(f"Warning: unknown Uniswap pool for token ID #{token_id}; skipping value calculation")
+            closed_ids.append(token_id)
+            continue
+
+        tick_lower = position["tick_lower"]
+        tick_upper = position["tick_upper"]
+        current_tick = slot0["tick"]
+        in_range = tick_lower <= current_tick <= tick_upper
+        amount0, amount1 = get_uni_amounts(
+            liquidity,
+            slot0["sqrt_price_x96"],
+            tick_lower,
+            tick_upper,
+            current_tick,
+        )
+        weth_amount = amount0 / 1e18
+        usdt_amount = amount1 / 1e6
+        weth_fees = position["tokens_owed0"] / 1e18
+        usdt_fees = position["tokens_owed1"] / 1e6
+
+        total_weth += weth_amount
+        total_usdt += usdt_amount
+        if eth_price is not None:
+            total_value += weth_amount * eth_price + usdt_amount
+            total_fees += weth_fees * eth_price + usdt_fees
+            valued_any = True
+        active_ids.append(token_id)
+        in_range_values.append(1 if in_range else 0)
+        tick_lowers.append(tick_lower)
+        tick_uppers.append(tick_upper)
+
+    return {
+        "uni_positions": count,
+        "uni_position_ids": ",".join(str(token_id) for token_id in token_ids),
+        "uni_active_position_ids": ",".join(str(token_id) for token_id in active_ids) if active_ids else None,
+        "uni_closed_position_ids": ",".join(str(token_id) for token_id in closed_ids) if closed_ids else None,
+        "uni_position_value": total_value if valued_any else None,
+        "uni_fees_unclaimed": total_fees if valued_any else None,
+        "uni_weth_amount": total_weth if tick_lowers else None,
+        "uni_usdt_amount": total_usdt if tick_lowers else None,
+        "uni_in_range": 1 if in_range_values and all(in_range_values) else 0 if in_range_values else None,
+        "uni_tick_lower": tick_lowers[0] if tick_lowers else None,
+        "uni_tick_upper": tick_uppers[0] if tick_uppers else None,
+        "uni_current_tick": slot0["tick"] if tick_lowers else None,
+        "uni_price_lower": tick_to_price(tick_lowers[0]) if tick_lowers else None,
+        "uni_price_upper": tick_to_price(tick_uppers[0]) if tick_uppers else None,
+    }
+
+
 def money(value: float | None) -> str:
     if value is None:
         return "N/A"
@@ -173,11 +353,16 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
     btc_price = raw.get("btc_price")
     aweth_balance = raw.get("aweth_balance")
     awbtc_balance = raw.get("awbtc_balance")
+    uni_position_value = raw.get("uni_position_value")
 
     aave_equity = collateral - debt if collateral is not None and debt is not None else None
     ltv_pct = (debt / collateral) * 100 if collateral and debt is not None else None
     eth_equity = (eth_main + eth_lp) * eth_price if None not in (eth_main, eth_lp, eth_price) else None
-    total_equity = aave_equity + eth_equity if aave_equity is not None and eth_equity is not None else None
+    total_equity = (
+        aave_equity + eth_equity + (uni_position_value or 0)
+        if aave_equity is not None and eth_equity is not None
+        else None
+    )
     btc_collateral_usd = awbtc_balance * btc_price if None not in (awbtc_balance, btc_price) else None
     liq_price_eth = None
     liq_price_btc = None
@@ -235,6 +420,19 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
         "awbtc_balance": awbtc_balance,
         "vdusdt_balance": raw.get("vdusdt_balance"),
         "uni_positions": raw.get("uni_positions"),
+        "uni_position_ids": raw.get("uni_position_ids"),
+        "uni_active_position_ids": raw.get("uni_active_position_ids"),
+        "uni_closed_position_ids": raw.get("uni_closed_position_ids"),
+        "uni_position_value": uni_position_value,
+        "uni_fees_unclaimed": raw.get("uni_fees_unclaimed"),
+        "uni_weth_amount": raw.get("uni_weth_amount"),
+        "uni_usdt_amount": raw.get("uni_usdt_amount"),
+        "uni_in_range": raw.get("uni_in_range"),
+        "uni_tick_lower": raw.get("uni_tick_lower"),
+        "uni_tick_upper": raw.get("uni_tick_upper"),
+        "uni_current_tick": raw.get("uni_current_tick"),
+        "uni_price_lower": raw.get("uni_price_lower"),
+        "uni_price_upper": raw.get("uni_price_upper"),
         "liq_price_eth": liq_price_eth,
         "liq_price_btc": liq_price_btc,
         "correlated_liq_drop_pct": correlated_liq_drop_pct,
@@ -282,13 +480,44 @@ def market_drop_class(drop_pct: float | None) -> str:
     return "green"
 
 
+def liquidation_status(drop_pct: float | None) -> tuple[str, str]:
+    risk_class = market_drop_class(drop_pct)
+    if risk_class == "red":
+        return "DANGER", "red"
+    if risk_class == "amber":
+        return "WATCH", "amber"
+    if risk_class == "green":
+        return "SAFE", "green"
+    return "UNKNOWN", "muted"
+
+
+def uni_status(snapshot: dict[str, Any]) -> tuple[str, str, str]:
+    if snapshot.get("uni_in_range") is None:
+        return "No active positions", "muted", "muted"
+    if snapshot.get("uni_in_range") == 1:
+        return "In Range", "green", "green"
+    return "Out of Range", "red", "red"
+
+
+def format_uni_ids(position_ids: str | None) -> str:
+    if not position_ids:
+        return "N/A"
+    return ", ".join(f"#{token_id}" for token_id in position_ids.split(","))
+
+
+def whole_money(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"${value:,.0f}"
+
+
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
     labels = [row["timestamp"][:10] for row in history]
     total_equity = [row.get("total_equity") for row in history]
     health_factors = [row.get("health_factor") for row in history]
     ltv_values = [row.get("ltv_pct") for row in history]
     eth_prices = [row.get("eth_price") for row in history]
-    eth_liq_prices = [row.get("liq_price_eth") for row in history]
+    uni_values = [row.get("uni_position_value") for row in history]
     health_colors = [
         "#34d399" if value is not None and value >= 1.5 else "#fbbf24" if value is not None and value >= 1.2 else "#f87171"
         for value in health_factors
@@ -302,13 +531,26 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         else None
     )
     eth_value = eth_total * snapshot["eth_price"] if eth_total is not None and snapshot.get("eth_price") is not None else None
-    uni_positions = snapshot.get("uni_positions")
-    uni_text = f"{uni_positions} active positions" if uni_positions else "No positions found"
-    uni_class = "green" if uni_positions else "muted"
-    eth_buffer = liquidation_buffer(snapshot.get("eth_price"), snapshot.get("liq_price_eth"))
-    btc_buffer = liquidation_buffer(snapshot.get("btc_price"), snapshot.get("liq_price_btc"))
-    risk_class = liquidation_risk_class(eth_buffer, btc_buffer)
-    market_drop_color = market_drop_class(snapshot.get("correlated_liq_drop_pct"))
+    uni_status_text, uni_status_class, uni_dot_class = uni_status(snapshot)
+    active_ids = format_uni_ids(snapshot.get("uni_active_position_ids"))
+    closed_ids = format_uni_ids(snapshot.get("uni_closed_position_ids"))
+    uni_weth_value = (
+        snapshot["uni_weth_amount"] * snapshot["eth_price"]
+        if snapshot.get("uni_weth_amount") is not None and snapshot.get("eth_price") is not None
+        else None
+    )
+    risk_label, risk_class = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
+    range_position = 50
+    if None not in (snapshot.get("uni_price_lower"), snapshot.get("uni_price_upper"), snapshot.get("eth_price")):
+        price_width = snapshot["uni_price_upper"] - snapshot["uni_price_lower"]
+        if price_width > 0:
+            range_position = max(
+                0,
+                min(
+                    100,
+                    ((snapshot["eth_price"] - snapshot["uni_price_lower"]) / price_width) * 100,
+                ),
+            )
     liquidation_equity_threshold = snapshot.get("aave_debt")
 
     html = f"""<!doctype html>
@@ -388,12 +630,42 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .banner.red {{ border-left-color: var(--red); }}
     .risk-box {{
       margin-bottom: 20px;
-      border-left: 5px solid var(--green);
+      border-left: 5px solid var(--muted);
     }}
+    .risk-box.green {{ border-left-color: var(--green); }}
     .risk-box.amber {{ border-left-color: var(--amber); }}
     .risk-box.red {{ border-left-color: var(--red); }}
-    .risk-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 22px; }}
+    .risk-grid {{ display: grid; grid-template-columns: 190px 1fr; gap: 8px 18px; }}
+    .risk-lead {{ font-size: 32px; font-weight: 760; margin-bottom: 4px; }}
+    .risk-copy {{ color: var(--muted); margin-bottom: 16px; }}
     .risk-status {{ margin-top: 14px; font-weight: 720; }}
+    .uni-card {{ margin-top: 20px; }}
+    .uni-grid {{ display: grid; grid-template-columns: 160px 1fr; gap: 9px 14px; }}
+    .status-dot {{ display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 7px; background: var(--muted); }}
+    .status-dot.green {{ background: var(--green); }}
+    .status-dot.red {{ background: var(--red); }}
+    .range-labels {{ display: flex; justify-content: space-between; margin-top: 14px; color: var(--muted); font-size: 13px; }}
+    .range-bar {{
+      position: relative;
+      height: 14px;
+      margin: 8px 0 20px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--red) 0 10%, var(--green) 10% 90%, var(--red) 90% 100%);
+    }}
+    .range-dot {{
+      position: absolute;
+      left: var(--range-position);
+      top: 50%;
+      width: 18px;
+      height: 18px;
+      border: 3px solid #ffffff;
+      border-radius: 999px;
+      background: var(--card);
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 0 2px rgba(15, 17, 21, 0.85);
+    }}
+    .range-now {{ text-align: center; color: var(--text); font-weight: 700; }}
+    .range-caption {{ margin-top: 18px; color: var(--muted); }}
     .label {{ color: var(--muted); font-size: 13px; }}
     .value {{ margin-top: 4px; font-size: 24px; font-weight: 720; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
@@ -446,32 +718,50 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">AAVE Debt</div><div class="value">{money(snapshot.get("aave_debt"))}</div></div>
       <div class="card kpi"><div class="label">aWETH Balance</div><div class="value">{number(snapshot.get("aweth_balance"), 6)}</div></div>
       <div class="card kpi"><div class="label">vdUSDT Balance</div><div class="value">{number(snapshot.get("vdusdt_balance"), 2)}</div></div>
-      <div class="card kpi"><div class="label">Liq Price ETH</div><div class="value red">{money(snapshot.get("liq_price_eth"))}</div></div>
-      <div class="card kpi"><div class="label">Liq Price BTC</div><div class="value red">{money(snapshot.get("liq_price_btc"))}</div></div>
       <div class="card kpi"><div class="label">aWBTC Balance</div><div class="value">{number(snapshot.get("awbtc_balance"), 8)} BTC</div></div>
-      <div class="card kpi"><div class="label">Distance to Liq ETH%</div><div class="value amber">{percent(eth_buffer)}</div></div>
-      <div class="card kpi"><div class="label">Market Drop to Liq</div><div class="value {market_drop_color}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div></div>
+      <div class="card kpi"><div class="label">Market Drop to Liq</div><div class="value {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div></div>
+      <div class="card kpi"><div class="label">LP Position Value</div><div class="value">{money(snapshot.get("uni_position_value"))}</div></div>
+      <div class="card kpi"><div class="label">Unclaimed Fees</div><div class="value amber">{money(snapshot.get("uni_fees_unclaimed"))}</div></div>
     </section>
 
     <section class="card risk-box {risk_class}">
-      <h2>LIQUIDATION RISK SUMMARY</h2>
+      <h2>LIQUIDATION RISK</h2>
+      <div class="risk-lead {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div>
+      <div class="risk-copy">Market must fall before you are liquidated</div>
       <div class="risk-grid">
-        <div><span class="label">ETH liq price:</span> <strong>{money(snapshot.get("liq_price_eth"))}</strong> <span class="muted">({percent(eth_buffer)} buffer)</span></div>
-        <div><span class="label">BTC liq price:</span> <strong>{money(snapshot.get("liq_price_btc"))}</strong> <span class="muted">({percent(btc_buffer)} buffer)</span></div>
-        <div><span class="label">Current ETH:</span> <strong>{money(snapshot.get("eth_price"))}</strong></div>
-        <div><span class="label">Current BTC:</span> <strong>{money(snapshot.get("btc_price"))}</strong></div>
-        <div><span class="label">Correlated drop to liquidation:</span> <strong>{signed_drop(snapshot.get("correlated_liq_drop_pct"))}</strong></div>
-        <div><span class="label">ETH price at liquidation:</span> <strong>{money(snapshot.get("correlated_liq_price_eth"))}</strong></div>
-        <div><span class="label">BTC price at liquidation:</span> <strong>{money(snapshot.get("correlated_liq_price_btc"))}</strong></div>
+        <div class="label">At that point:</div><div></div>
+        <div class="label">ETH would be at</div><div><strong>{whole_money(snapshot.get("correlated_liq_price_eth"))}</strong></div>
+        <div class="label">BTC would be at</div><div><strong>{whole_money(snapshot.get("correlated_liq_price_btc"))}</strong></div>
+        <div class="label">Current ETH</div><div>{whole_money(snapshot.get("eth_price"))}</div>
+        <div class="label">Current BTC</div><div>{whole_money(snapshot.get("btc_price"))}</div>
       </div>
-      <div class="risk-status {risk_class}">{risk_class.upper()}</div>
+      <div class="risk-status {risk_class}"><span class="status-dot {risk_class}"></span>{risk_label}</div>
+    </section>
+
+    <section class="card uni-card">
+      <h2>UNISWAP V3 POSITION</h2>
+      <div class="uni-grid">
+        <div class="label">Pool:</div><div>WETH / USDT 0.3%</div>
+        <div class="label">Active:</div><div>{escape(active_ids)}</div>
+        <div class="label">Closed:</div><div>{escape(closed_ids)}</div>
+        <div class="label">Status:</div><div class="{uni_status_class}"><span class="status-dot {uni_dot_class}"></span>{escape(uni_status_text)}</div>
+        <div class="label">WETH:</div><div>{number(snapshot.get("uni_weth_amount"), 4)} ETH <span class="muted">({money(uni_weth_value)})</span></div>
+        <div class="label">USDT:</div><div>{number(snapshot.get("uni_usdt_amount"), 2)} USDT <span class="muted">({money(snapshot.get("uni_usdt_amount"))})</span></div>
+        <div class="label">Total value:</div><div>{money(snapshot.get("uni_position_value"))}</div>
+        <div class="label">Unclaimed fees:</div><div>{money(snapshot.get("uni_fees_unclaimed"))}</div>
+        <div class="label">Range:</div><div>{whole_money(snapshot.get("uni_price_lower"))} - {whole_money(snapshot.get("uni_price_upper"))} <span class="muted">(current {whole_money(snapshot.get("eth_price"))})</span></div>
+      </div>
+      <div class="range-caption">ETH/USDT 0.3% &middot; {escape(uni_status_text)} &middot; 10 days active</div>
+      <div class="range-labels"><span>{whole_money(snapshot.get("uni_price_lower"))}</span><span>{whole_money(snapshot.get("uni_price_upper"))}</span></div>
+      <div class="range-bar" style="--range-position: {range_position:.2f}%"><span class="range-dot"></span></div>
+      <div class="range-now">{whole_money(snapshot.get("eth_price"))}</div>
     </section>
 
     <section class="charts">
       <div class="card"><h2>30-day Total Equity trend</h2><div class="chart-wrap"><canvas id="equityChart"></canvas></div></div>
       <div class="card"><h2>AAVE Health Factor over time</h2><div class="chart-wrap"><canvas id="hfChart"></canvas></div></div>
       <div class="card"><h2>LTV% over time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
-      <div class="card"><h2>ETH Price vs Liquidation Level</h2><div class="chart-wrap"><canvas id="ethLiqChart"></canvas></div></div>
+      <div class="card"><h2>Uniswap LP Position Value</h2><div class="chart-wrap"><canvas id="uniValueChart"></canvas></div></div>
     </section>
 
     <section class="two-col">
@@ -484,10 +774,6 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
             <tr><td>ETH Balances</td><td>{number(snapshot.get("eth_main"), 6)} main</td><td>{number(snapshot.get("eth_lp"), 6)} LP</td><td>{number(eth_total, 6)} total ETH</td><td>{money(eth_value)}</td></tr>
           </tbody>
         </table>
-      </div>
-      <div class="card">
-        <h2>Uniswap status</h2>
-        <div class="value {uni_class}">{escape(uni_text)}</div>
       </div>
     </section>
 
@@ -518,7 +804,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     const healthColors = {js_json(health_colors)};
     const ltvValues = {js_json(ltv_values)};
     const ethPrices = {js_json(eth_prices)};
-    const ethLiqPrices = {js_json(eth_liq_prices)};
+    const uniValues = {js_json(uni_values)};
     const liquidationEquityThreshold = {js_json(liquidation_equity_threshold)};
 
     const gridColor = "#262a33";
@@ -582,20 +868,10 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       plugins: [linePlugin("ltvWarning", 80, "#f87171")]
     }});
 
-    new Chart(document.getElementById("ethLiqChart"), {{
+    new Chart(document.getElementById("uniValueChart"), {{
       type: "line",
-      data: {{
-        labels,
-        datasets: [
-          {{ label: "ETH price", data: ethPrices, borderColor: "#a5b4fc", tension: 0.25, spanGaps: true }},
-          {{ label: "ETH liq price", data: ethLiqPrices, borderColor: "#f87171", borderDash: [6, 6], tension: 0.25, spanGaps: true }}
-        ]
-      }},
-      options: {{
-        ...commonOptions,
-        plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
-        scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: value => "$" + Number(value).toLocaleString() }} }} }}
-      }}
+      data: {{ labels, datasets: [{{ data: uniValues, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, spanGaps: true }}] }},
+      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: moneyTick }} }} }} }}
     }});
   </script>
 </body>
@@ -616,7 +892,6 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         ("aWETH balance", "aweth_balance", lambda: fetch_token_balance(AWETH, MAIN_WALLET, 18)),
         ("aWBTC balance", "awbtc_balance", lambda: fetch_token_balance(AWBTC, MAIN_WALLET, 8)),
         ("vdUSDT balance", "vdusdt_balance", lambda: fetch_token_balance(VDUSDT, MAIN_WALLET, 6)),
-        ("Uniswap V3 position count", "uni_positions", lambda: fetch_uni_position_count(LP_WALLET)),
     ]
 
     aave_data, ok = safe_fetch("AAVE user data", lambda: fetch_aave_user_data(MAIN_WALLET))
@@ -630,6 +905,29 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         value, ok = safe_fetch(label, fetcher)
         raw[key] = value
         successes += 1 if ok else 0
+
+    uni_data, ok = safe_fetch(
+        "Uniswap V3 position details",
+        lambda: fetch_uni_position_details(LP_WALLET, raw.get("eth_price")),
+    )
+    if ok:
+        successes += 1
+        raw.update(uni_data)
+    else:
+        raw.update(
+            {
+                "uni_positions": None,
+                "uni_position_ids": None,
+                "uni_position_value": None,
+                "uni_fees_unclaimed": None,
+                "uni_weth_amount": None,
+                "uni_usdt_amount": None,
+                "uni_in_range": None,
+                "uni_tick_lower": None,
+                "uni_tick_upper": None,
+                "uni_current_tick": None,
+            }
+        )
 
     return raw, successes
 
@@ -650,16 +948,23 @@ def run_data_fetch() -> bool:
         return False
 
     snapshot = compute_snapshot(raw, timestamp)
-    eth_buffer = liquidation_buffer(snapshot.get("eth_price"), snapshot.get("liq_price_eth"))
-    btc_buffer = liquidation_buffer(snapshot.get("btc_price"), snapshot.get("liq_price_btc"))
+    risk_label, _ = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
     print(f"ETH price:        {money(snapshot.get('eth_price'))}")
-    print(f"ETH liq price:    {money(snapshot.get('liq_price_eth'))}  ({percent(eth_buffer)} buffer)")
     print(f"BTC price:        {money(snapshot.get('btc_price'))}")
-    print(f"BTC liq price:    {money(snapshot.get('liq_price_btc'))}  ({percent(btc_buffer)} buffer)")
-    print(f"Correlated liq drop:  {signed_drop(snapshot.get('correlated_liq_drop_pct'))}  (both assets fall together)")
-    print(f"ETH at liq:           {money(snapshot.get('correlated_liq_price_eth'))}")
-    print(f"BTC at liq:           {money(snapshot.get('correlated_liq_price_btc'))}")
     print(f"Health Factor:    {number(snapshot.get('health_factor'), 2)}")
+    print("Liquidation risk:")
+    print(f"  Market drop to liq:  {signed_drop(snapshot.get('correlated_liq_drop_pct'))}")
+    print(f"  ETH at liq:          {whole_money(snapshot.get('correlated_liq_price_eth'))}")
+    print(f"  BTC at liq:          {whole_money(snapshot.get('correlated_liq_price_btc'))}")
+    print(f"  Status:              {risk_label}")
+    uni_status_text, _, _ = uni_status(snapshot)
+    print("Uniswap LP:")
+    print(f"  Token ID:       {format_uni_ids(snapshot.get('uni_position_ids'))}")
+    print(f"  Status:         {uni_status_text}")
+    print(f"  WETH:           {number(snapshot.get('uni_weth_amount'), 4)} ETH")
+    print(f"  USDT:           {number(snapshot.get('uni_usdt_amount'), 2)} USDT")
+    print(f"  Position value: {money(snapshot.get('uni_position_value'))}")
+    print(f"  Unclaimed fees: {money(snapshot.get('uni_fees_unclaimed'))}")
 
     init_db()
     insert_snapshot(snapshot)
