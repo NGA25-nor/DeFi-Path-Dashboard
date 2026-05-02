@@ -14,8 +14,8 @@ from db import get_history, init_db, insert_snapshot
 
 
 # --- USER CONFIGURATION ---
-MAIN_WALLET = "0xYOUR_AAVE_WALLET_HERE"  # AAVE collateral & debt
-LP_WALLET = "0xYOUR_UNI_WALLET_HERE"  # Uniswap V3 LP positions
+MAIN_WALLET = "0x0C4bE1AC7edf172E0F617548F2a3e76561DEbc2E"  # AAVE collateral & debt
+LP_WALLET = "x0C4bE1AC7edf172E0F617548F2a3e76561DEbc2E"  # Uniswap V3 LP positions
 RPC_URL = "https://ethereum-rpc.publicnode.com"
 # --------------------------
 
