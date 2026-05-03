@@ -1058,10 +1058,14 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
 
     const gridColor = "#262a33";
     const textColor = "#9ca3af";
-    const moneyTick = value => {{
-      if (value === null || Number.isNaN(value)) return "";
-      return "$" + (value / 1000).toFixed(0) + "k";
-    }};
+    function formatUSD(value) {{
+        if (value === null || value === undefined || isNaN(value)) return '';
+        const abs = Math.abs(value);
+        if (abs >= 1000000) return '$' + (value / 1000000).toFixed(1) + 'M';
+        if (abs >= 1000) return '$' + (value / 1000).toFixed(1) + 'k';
+        if (abs >= 1) return '$' + Math.round(value);
+        return '$' + value.toFixed(2);
+    }}
 
     const linePlugin = (id, yValue, color, label) => ({{
       id,
@@ -1099,7 +1103,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     new Chart(document.getElementById("equityChart"), {{
       type: "line",
       data: {{ labels, datasets: [{{ data: equity, borderColor: "#a5b4fc", backgroundColor: "rgba(165, 180, 252, 0.15)", tension: 0.25, spanGaps: true }}] }},
-      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: moneyTick }} }} }} }},
+      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: formatUSD }} }} }} }},
       plugins: [linePlugin("equityLiqThreshold", liquidationEquityThreshold, "#f87171", "Liq threshold")]
     }});
 
@@ -1120,7 +1124,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     new Chart(document.getElementById("uniValueChart"), {{
       type: "line",
       data: {{ labels, datasets: [{{ data: uniValues, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, spanGaps: true }}] }},
-      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: moneyTick }} }} }} }}
+      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: formatUSD }} }} }} }}
     }});
 
     new Chart(document.getElementById("dailyYieldChart"), {{
@@ -1137,7 +1141,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
         scales: {{
           x: {{ ...commonOptions.scales.x, stacked: true }},
-          y: {{ ...commonOptions.scales.y, stacked: true, ticks: {{ color: textColor, callback: moneyTick }} }}
+          y: {{ ...commonOptions.scales.y, stacked: true, ticks: {{ color: textColor, callback: formatUSD }} }}
         }}
       }}
     }});
@@ -1156,8 +1160,8 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
         scales: {{
           x: {{ ticks: {{ color: textColor }}, grid: {{ color: gridColor }} }},
-          y: {{ position: "left", ticks: {{ color: textColor, callback: moneyTick }}, grid: {{ color: gridColor }} }},
-          y1: {{ position: "right", ticks: {{ color: textColor, callback: moneyTick }}, grid: {{ drawOnChartArea: false }} }}
+          y: {{ position: "left", ticks: {{ color: textColor, callback: formatUSD }}, grid: {{ color: gridColor }} }},
+          y1: {{ position: "right", ticks: {{ color: textColor, callback: formatUSD }}, grid: {{ drawOnChartArea: false }} }}
         }}
       }}
     }});
