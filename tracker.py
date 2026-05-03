@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import http.server
 import json
 import math
@@ -15,6 +16,10 @@ from typing import Any
 import requests
 
 from config import LP_WALLET, MAIN_WALLET
+try:
+    from config import GRAPH_API_KEY
+except ImportError:
+    GRAPH_API_KEY = None
 from db import get_history, init_db, insert_snapshot
 
 
@@ -39,10 +44,14 @@ BTC_LIQ_THRESHOLD = 0.750
 LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 BALANCE_OF_SELECTOR = "0x70a08231"
 AAVE_USER_DATA_SELECTOR = "0xbf92857c"
+GET_RESERVE_DATA_SELECTOR = "0x35ea6a75"
 TOKEN_OF_OWNER_BY_INDEX_SELECTOR = "0x2f745c59"
 POSITIONS_SELECTOR = "0x99fbab88"
 SLOT0_SELECTOR = "0x3850c7bd"
 Q96 = 2**96
+Q128 = 2**128
+RAY = 1e27
+UNISWAP_V3_SUBGRAPH_ID = "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
 
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_PATH = BASE_DIR / "dashboard.html"
@@ -107,6 +116,17 @@ def decode_uint_words(result: str) -> list[int]:
     return [int(hex_data[index : index + 64], 16) for index in range(0, len(hex_data), 64)]
 
 
+def decode_reserve_rate(hex_data: str, word_index: int) -> int:
+    if not hex_data or hex_data == "0x":
+        return 0
+    data = hex_data[2:] if hex_data.startswith("0x") else hex_data
+    start = word_index * 64
+    end = start + 64
+    if len(data) < end:
+        return 0
+    return int(data[start:end], 16)
+
+
 def safe_fetch(label: str, fetcher: Any) -> tuple[Any, bool]:
     try:
         return fetcher(), True
@@ -139,6 +159,18 @@ def fetch_aave_user_data(wallet: str) -> dict[str, float]:
         "aave_collateral": collateral,
         "aave_debt": debt,
         "health_factor": words[5] / 1e18,
+    }
+
+
+def fetch_aave_reserve_rates(asset: str) -> dict[str, float]:
+    result = eth_call(AAVE_POOL, GET_RESERVE_DATA_SELECTOR + pad_address(asset))
+    liquidity_rate = decode_reserve_rate(result, 2)
+    borrow_rate = decode_reserve_rate(result, 4)
+    if liquidity_rate == 0 and borrow_rate == 0:
+        raise RpcError("getReserveData returned too few fields")
+    return {
+        "supply_apy_pct": (liquidity_rate / RAY) * 100,
+        "borrow_apy_pct": (borrow_rate / RAY) * 100,
     }
 
 
@@ -222,6 +254,127 @@ def get_uni_amounts(
     return max(amount0, 0), max(amount1, 0)
 
 
+def fetch_unclaimed_fees_subgraph(token_ids: list[int]) -> list[dict[str, Any]]:
+    if not token_ids:
+        return []
+    if not GRAPH_API_KEY:
+        print("  Warning: GRAPH_API_KEY not set in config.py — fees shown as $0.00")
+        return []
+
+    ids = ", ".join(f'"{token_id}"' for token_id in token_ids)
+    query = f"""
+    {{
+      positions(where: {{id_in: [{ids}]}}) {{
+        id
+        feeGrowthInside0LastX128
+        feeGrowthInside1LastX128
+        liquidity
+        token0 {{
+          symbol
+          decimals
+        }}
+        token1 {{
+          symbol
+          decimals
+        }}
+        pool {{
+          feeGrowthGlobal0X128
+          feeGrowthGlobal1X128
+          tick
+        }}
+        tickLower {{
+          tickIdx
+          feeGrowthOutside0X128
+          feeGrowthOutside1X128
+        }}
+        tickUpper {{
+          tickIdx
+          feeGrowthOutside0X128
+          feeGrowthOutside1X128
+        }}
+      }}
+    }}
+    """
+
+    try:
+        url = f"https://gateway.thegraph.com/api/{GRAPH_API_KEY}/subgraphs/id/{UNISWAP_V3_SUBGRAPH_ID}"
+        response = requests.post(url, json={"query": query}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("errors"):
+            print(f"  Warning: Subgraph query failed: {data['errors']}")
+            return []
+        return data.get("data", {}).get("positions", [])
+    except Exception as exc:
+        print(f"  Warning: Subgraph query failed: {exc}")
+        return []
+
+
+def compute_fees_from_subgraph(position: dict[str, Any], eth_price: float | None) -> tuple[float, float, float]:
+    try:
+        liquidity = int(position["liquidity"])
+        if liquidity == 0:
+            return 0.0, 0.0, 0.0
+
+        fg0 = int(position["pool"]["feeGrowthGlobal0X128"])
+        fg1 = int(position["pool"]["feeGrowthGlobal1X128"])
+        current_tick = int(position["pool"]["tick"])
+
+        tick_lower = position["tickLower"]
+        tick_upper = position["tickUpper"]
+        tick_lower_idx = int(tick_lower["tickIdx"])
+        tick_upper_idx = int(tick_upper["tickIdx"])
+
+        fo0_lower = int(tick_lower["feeGrowthOutside0X128"])
+        fo1_lower = int(tick_lower["feeGrowthOutside1X128"])
+        fo0_upper = int(tick_upper["feeGrowthOutside0X128"])
+        fo1_upper = int(tick_upper["feeGrowthOutside1X128"])
+        fi0 = int(position["feeGrowthInside0LastX128"])
+        fi1 = int(position["feeGrowthInside1LastX128"])
+
+        if current_tick >= tick_lower_idx:
+            fb0 = fo0_lower
+            fb1 = fo1_lower
+        else:
+            fb0 = (fg0 - fo0_lower) % Q128
+            fb1 = (fg1 - fo1_lower) % Q128
+
+        if current_tick < tick_upper_idx:
+            fa0 = fo0_upper
+            fa1 = fo1_upper
+        else:
+            fa0 = (fg0 - fo0_upper) % Q128
+            fa1 = (fg1 - fo1_upper) % Q128
+
+        fg_inside0 = (fg0 - fb0 - fa0) % Q128
+        fg_inside1 = (fg1 - fb1 - fa1) % Q128
+
+        token0_decimals = int(position["token0"]["decimals"])
+        token1_decimals = int(position["token1"]["decimals"])
+        amount0 = (liquidity * ((fg_inside0 - fi0) % Q128)) / Q128 / (10**token0_decimals)
+        amount1 = (liquidity * ((fg_inside1 - fi1) % Q128)) / Q128 / (10**token1_decimals)
+
+        token0_symbol = position["token0"]["symbol"]
+        token1_symbol = position["token1"]["symbol"]
+        usd = 0.0
+        if token0_symbol in ("WETH", "ETH") and eth_price is not None:
+            usd += amount0 * eth_price
+        else:
+            usd += amount0
+
+        if token1_symbol in ("USDT", "USDC", "DAI"):
+            usd += amount1
+        elif token1_symbol in ("WETH", "ETH") and eth_price is not None:
+            usd += amount1 * eth_price
+        else:
+            usd += amount1
+
+        return amount0, amount1, max(0.0, usd)
+    except Exception as exc:
+        print(f"  Warning: Fee calculation failed for position: {exc}")
+        return 0.0, 0.0, 0.0
+
+
 def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str, Any]:
     count = fetch_uni_position_count(wallet)
     if count <= 0:
@@ -241,7 +394,6 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
     token_ids = fetch_uni_token_ids(wallet, count)
     slot0 = fetch_weth_usdt_slot0()
     total_value = 0.0
-    total_fees = 0.0
     total_weth = 0.0
     total_usdt = 0.0
     in_range_values = []
@@ -278,19 +430,38 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
         )
         weth_amount = amount0 / 1e18
         usdt_amount = amount1 / 1e6
-        weth_fees = position["tokens_owed0"] / 1e18
-        usdt_fees = position["tokens_owed1"] / 1e6
 
         total_weth += weth_amount
         total_usdt += usdt_amount
         if eth_price is not None:
             total_value += weth_amount * eth_price + usdt_amount
-            total_fees += weth_fees * eth_price + usdt_fees
             valued_any = True
         active_ids.append(token_id)
         in_range_values.append(1 if in_range else 0)
         tick_lowers.append(tick_lower)
         tick_uppers.append(tick_upper)
+
+    total_fees = 0.0
+    total_weth_fees = 0.0
+    total_usdt_fees = 0.0
+    subgraph_positions = fetch_unclaimed_fees_subgraph(active_ids)
+    if active_ids and not subgraph_positions:
+        print("  Warning: Subgraph unavailable — fees shown as $0.00")
+
+    for subgraph_position in subgraph_positions:
+        amount0, amount1, fee_usd = compute_fees_from_subgraph(subgraph_position, eth_price)
+        total_fees += fee_usd
+        token0_symbol = subgraph_position["token0"]["symbol"]
+        token1_symbol = subgraph_position["token1"]["symbol"]
+        if token0_symbol in ("WETH", "ETH"):
+            total_weth_fees += amount0
+        elif token0_symbol in ("USDT", "USDC", "DAI"):
+            total_usdt_fees += amount0
+
+        if token1_symbol in ("WETH", "ETH"):
+            total_weth_fees += amount1
+        elif token1_symbol in ("USDT", "USDC", "DAI"):
+            total_usdt_fees += amount1
 
     return {
         "uni_positions": count,
@@ -299,6 +470,8 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
         "uni_closed_position_ids": ",".join(str(token_id) for token_id in closed_ids) if closed_ids else None,
         "uni_position_value": total_value if valued_any else None,
         "uni_fees_unclaimed": total_fees if valued_any else None,
+        "uni_weth_fees": total_weth_fees if valued_any else None,
+        "uni_usdt_fees": total_usdt_fees if valued_any else None,
         "uni_weth_amount": total_weth if tick_lowers else None,
         "uni_usdt_amount": total_usdt if tick_lowers else None,
         "uni_in_range": 1 if in_range_values and all(in_range_values) else 0 if in_range_values else None,
@@ -344,7 +517,12 @@ def js_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True).replace("</", "<\\/")
 
 
-def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
+def compute_snapshot(
+    raw: dict[str, Any],
+    timestamp: str,
+    previous_fees_usd: float | None = None,
+    gas_eth: float = 0.0,
+) -> dict[str, Any]:
     collateral = raw.get("aave_collateral")
     debt = raw.get("aave_debt")
     eth_main = raw.get("eth_main")
@@ -354,6 +532,10 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
     aweth_balance = raw.get("aweth_balance")
     awbtc_balance = raw.get("awbtc_balance")
     uni_position_value = raw.get("uni_position_value")
+    vdusdt_balance = raw.get("vdusdt_balance")
+    eth_supply_apy = raw.get("eth_supply_apy")
+    usdt_borrow_apy = raw.get("usdt_borrow_apy")
+    uni_fees_unclaimed = raw.get("uni_fees_unclaimed")
 
     aave_equity = collateral - debt if collateral is not None and debt is not None else None
     ltv_pct = (debt / collateral) * 100 if collateral and debt is not None else None
@@ -369,6 +551,11 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
     correlated_liq_drop_pct = None
     correlated_liq_price_eth = None
     correlated_liq_price_btc = None
+    aave_daily_carry = None
+    uni_daily_fee_yield = 0.0 if previous_fees_usd is None else None
+    gas_usd = gas_eth * eth_price if eth_price is not None else None
+    gas_drag_pct = 0.0
+    total_daily_yield = None
 
     if (
         debt is not None
@@ -405,6 +592,22 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
             correlated_liq_price_eth = eth_price * (1 - correlated_liq_drop_pct / 100)
             correlated_liq_price_btc = btc_price * (1 - correlated_liq_drop_pct / 100)
 
+    if None not in (aweth_balance, eth_price, eth_supply_apy, vdusdt_balance, usdt_borrow_apy):
+        aave_daily_carry = (
+            aweth_balance * eth_price * (eth_supply_apy / 100) / 365
+        ) - (vdusdt_balance * (usdt_borrow_apy / 100) / 365)
+
+    if uni_fees_unclaimed is not None:
+        if previous_fees_usd is None:
+            uni_daily_fee_yield = 0.0
+        else:
+            uni_daily_fee_yield = max(0.0, uni_fees_unclaimed - previous_fees_usd)
+
+    if aave_daily_carry is not None and uni_daily_fee_yield is not None:
+        total_daily_yield = aave_daily_carry + uni_daily_fee_yield
+        if gas_usd is not None and total_daily_yield > 0:
+            gas_drag_pct = (gas_usd / total_daily_yield) * 100
+
     return {
         "timestamp": timestamp,
         "eth_price": eth_price,
@@ -418,13 +621,15 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
         "ltv_pct": ltv_pct,
         "aweth_balance": aweth_balance,
         "awbtc_balance": awbtc_balance,
-        "vdusdt_balance": raw.get("vdusdt_balance"),
+        "vdusdt_balance": vdusdt_balance,
         "uni_positions": raw.get("uni_positions"),
         "uni_position_ids": raw.get("uni_position_ids"),
         "uni_active_position_ids": raw.get("uni_active_position_ids"),
         "uni_closed_position_ids": raw.get("uni_closed_position_ids"),
         "uni_position_value": uni_position_value,
         "uni_fees_unclaimed": raw.get("uni_fees_unclaimed"),
+        "uni_weth_fees": raw.get("uni_weth_fees"),
+        "uni_usdt_fees": raw.get("uni_usdt_fees"),
         "uni_weth_amount": raw.get("uni_weth_amount"),
         "uni_usdt_amount": raw.get("uni_usdt_amount"),
         "uni_in_range": raw.get("uni_in_range"),
@@ -438,6 +643,14 @@ def compute_snapshot(raw: dict[str, Any], timestamp: str) -> dict[str, Any]:
         "correlated_liq_drop_pct": correlated_liq_drop_pct,
         "correlated_liq_price_eth": correlated_liq_price_eth,
         "correlated_liq_price_btc": correlated_liq_price_btc,
+        "eth_supply_apy": eth_supply_apy,
+        "usdt_borrow_apy": usdt_borrow_apy,
+        "aave_daily_carry": aave_daily_carry,
+        "uni_daily_fee_yield": uni_daily_fee_yield,
+        "gas_eth": gas_eth,
+        "gas_usd": gas_usd,
+        "gas_drag_pct": gas_drag_pct,
+        "total_daily_yield": total_daily_yield,
         "total_equity": total_equity,
         "notes": raw.get("notes"),
     }
@@ -518,6 +731,13 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     ltv_values = [row.get("ltv_pct") for row in history]
     eth_prices = [row.get("eth_price") for row in history]
     uni_values = [row.get("uni_position_value") for row in history]
+    fee_yields = [row.get("uni_daily_fee_yield") for row in history]
+    aave_carries = [row.get("aave_daily_carry") for row in history]
+    cumulative_fee_yields = []
+    running_fees = 0.0
+    for value in fee_yields:
+        running_fees += value or 0
+        cumulative_fee_yields.append(running_fees)
     health_colors = [
         "#34d399" if value is not None and value >= 1.5 else "#fbbf24" if value is not None and value >= 1.2 else "#f87171"
         for value in health_factors
@@ -540,6 +760,14 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         else None
     )
     risk_label, risk_class = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
+    carry_class = "green" if (snapshot.get("aave_daily_carry") or 0) >= 0 else "red"
+    gas_row = ""
+    if snapshot.get("gas_usd") is not None and snapshot.get("gas_usd") > 0:
+        gas_row = f"""
+    <section class="gas-row">
+      Gas today: {number(snapshot.get("gas_eth"), 6)} ETH ({money(snapshot.get("gas_usd"))}) | Gas drag: {percent(snapshot.get("gas_drag_pct"), 1)} of yield
+    </section>
+"""
     range_position = 50
     if None not in (snapshot.get("uni_price_lower"), snapshot.get("uni_price_upper"), snapshot.get("eth_price")):
         price_width = snapshot["uni_price_upper"] - snapshot["uni_price_lower"]
@@ -666,6 +894,14 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     }}
     .range-now {{ text-align: center; color: var(--text); font-weight: 700; }}
     .range-caption {{ margin-top: 18px; color: var(--muted); }}
+    .gas-row {{
+      margin: -8px 0 20px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: rgba(251, 191, 36, 0.06);
+    }}
     .label {{ color: var(--muted); font-size: 13px; }}
     .value {{ margin-top: 4px; font-size: 24px; font-weight: 720; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
@@ -722,7 +958,13 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">Market Drop to Liq</div><div class="value {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div></div>
       <div class="card kpi"><div class="label">LP Position Value</div><div class="value">{money(snapshot.get("uni_position_value"))}</div></div>
       <div class="card kpi"><div class="label">Unclaimed Fees</div><div class="value amber">{money(snapshot.get("uni_fees_unclaimed"))}</div></div>
+      <div class="card kpi"><div class="label">ETH Supply APY</div><div class="value green">{percent(snapshot.get("eth_supply_apy"), 2)}</div></div>
+      <div class="card kpi"><div class="label">USDT Borrow APY</div><div class="value red">{percent(snapshot.get("usdt_borrow_apy"), 2)}</div></div>
+      <div class="card kpi"><div class="label">Daily Carry</div><div class="value {carry_class}">{money(snapshot.get("aave_daily_carry"))}</div></div>
+      <div class="card kpi"><div class="label">Daily Fee Yield</div><div class="value amber">{money(snapshot.get("uni_daily_fee_yield"))}</div></div>
+      <div class="card kpi"><div class="label">Total Daily Yield</div><div class="value green">{money(snapshot.get("total_daily_yield"))}</div></div>
     </section>
+{gas_row}
 
     <section class="card risk-box {risk_class}">
       <h2>LIQUIDATION RISK</h2>
@@ -762,6 +1004,8 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card"><h2>AAVE Health Factor over time</h2><div class="chart-wrap"><canvas id="hfChart"></canvas></div></div>
       <div class="card"><h2>LTV% over time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
       <div class="card"><h2>Uniswap LP Position Value</h2><div class="chart-wrap"><canvas id="uniValueChart"></canvas></div></div>
+      <div class="card"><h2>Daily Yield Breakdown</h2><div class="chart-wrap"><canvas id="dailyYieldChart"></canvas></div></div>
+      <div class="card"><h2>Cumulative LP Fees Earned</h2><div class="chart-wrap"><canvas id="cumulativeFeesChart"></canvas></div></div>
     </section>
 
     <section class="two-col">
@@ -805,6 +1049,9 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     const ltvValues = {js_json(ltv_values)};
     const ethPrices = {js_json(eth_prices)};
     const uniValues = {js_json(uni_values)};
+    const feeYields = {js_json(fee_yields)};
+    const aaveCarries = {js_json(aave_carries)};
+    const cumulativeFeeYields = {js_json(cumulative_fee_yields)};
     const liquidationEquityThreshold = {js_json(liquidation_equity_threshold)};
 
     const gridColor = "#262a33";
@@ -873,6 +1120,45 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       data: {{ labels, datasets: [{{ data: uniValues, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, spanGaps: true }}] }},
       options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: moneyTick }} }} }} }}
     }});
+
+    new Chart(document.getElementById("dailyYieldChart"), {{
+      type: "bar",
+      data: {{
+        labels,
+        datasets: [
+          {{ label: "Daily Fee Yield", data: feeYields, backgroundColor: "#34d399", stack: "yield" }},
+          {{ label: "AAVE Daily Carry", data: aaveCarries, backgroundColor: "#818cf8", stack: "yield" }}
+        ]
+      }},
+      options: {{
+        ...commonOptions,
+        plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
+        scales: {{
+          x: {{ ...commonOptions.scales.x, stacked: true }},
+          y: {{ ...commonOptions.scales.y, stacked: true, ticks: {{ color: textColor, callback: moneyTick }} }}
+        }}
+      }}
+    }});
+
+    new Chart(document.getElementById("cumulativeFeesChart"), {{
+      data: {{
+        labels,
+        datasets: [
+          {{ type: "bar", label: "Daily Fee Yield", data: feeYields, backgroundColor: "#fbbf24", yAxisID: "y" }},
+          {{ type: "line", label: "Cumulative Fees", data: cumulativeFeeYields, borderColor: "#f59e0b", backgroundColor: "rgba(251, 191, 36, 0.15)", tension: 0.25, yAxisID: "y1" }}
+        ]
+      }},
+      options: {{
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
+        scales: {{
+          x: {{ ticks: {{ color: textColor }}, grid: {{ color: gridColor }} }},
+          y: {{ position: "left", ticks: {{ color: textColor, callback: moneyTick }}, grid: {{ color: gridColor }} }},
+          y1: {{ position: "right", ticks: {{ color: textColor, callback: moneyTick }}, grid: {{ drawOnChartArea: false }} }}
+        }}
+      }}
+    }});
   </script>
 </body>
 </html>
@@ -901,6 +1187,20 @@ def fetch_all() -> tuple[dict[str, Any], int]:
     else:
         raw.update({"aave_collateral": None, "aave_debt": None, "health_factor": None})
 
+    weth_rates, ok = safe_fetch("AAVE WETH reserve rates", lambda: fetch_aave_reserve_rates(WETH))
+    if ok:
+        successes += 1
+        raw["eth_supply_apy"] = weth_rates["supply_apy_pct"]
+    else:
+        raw["eth_supply_apy"] = None
+
+    usdt_rates, ok = safe_fetch("AAVE USDT reserve rates", lambda: fetch_aave_reserve_rates(USDT))
+    if ok:
+        successes += 1
+        raw["usdt_borrow_apy"] = usdt_rates["borrow_apy_pct"]
+    else:
+        raw["usdt_borrow_apy"] = None
+
     for label, key, fetcher in fetches:
         value, ok = safe_fetch(label, fetcher)
         raw[key] = value
@@ -920,6 +1220,8 @@ def fetch_all() -> tuple[dict[str, Any], int]:
                 "uni_position_ids": None,
                 "uni_position_value": None,
                 "uni_fees_unclaimed": None,
+                "uni_weth_fees": None,
+                "uni_usdt_fees": None,
                 "uni_weth_amount": None,
                 "uni_usdt_amount": None,
                 "uni_in_range": None,
@@ -932,7 +1234,7 @@ def fetch_all() -> tuple[dict[str, Any], int]:
     return raw, successes
 
 
-def run_data_fetch() -> bool:
+def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print("Fetching on-chain data...")
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -947,7 +1249,10 @@ def run_data_fetch() -> bool:
         print("Error: all RPC calls failed. No database row written.")
         return False
 
-    snapshot = compute_snapshot(raw, timestamp)
+    init_db()
+    previous_rows = get_history(1)
+    previous_fees_usd = previous_rows[-1].get("uni_fees_unclaimed") if previous_rows else None
+    snapshot = compute_snapshot(raw, timestamp, previous_fees_usd, gas_eth)
     risk_label, _ = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
     print(f"ETH price:        {money(snapshot.get('eth_price'))}")
     print(f"BTC price:        {money(snapshot.get('btc_price'))}")
@@ -957,6 +1262,15 @@ def run_data_fetch() -> bool:
     print(f"  ETH at liq:          {whole_money(snapshot.get('correlated_liq_price_eth'))}")
     print(f"  BTC at liq:          {whole_money(snapshot.get('correlated_liq_price_btc'))}")
     print(f"  Status:              {risk_label}")
+    print("AAVE Rates:")
+    print(f"  WETH supply APY:   {percent(snapshot.get('eth_supply_apy'), 2)}")
+    print(f"  USDT borrow APY:   {percent(snapshot.get('usdt_borrow_apy'), 2)}")
+    print(f"  Daily carry:       {money(snapshot.get('aave_daily_carry'))}")
+    print("Yield today:")
+    print(f"  LP fee yield:      {money(snapshot.get('uni_daily_fee_yield'))}")
+    print(f"  AAVE carry:        {money(snapshot.get('aave_daily_carry'))}")
+    print(f"  Total:             {money(snapshot.get('total_daily_yield'))}")
+    print(f"  Gas drag:          {percent(snapshot.get('gas_drag_pct'), 1)}")
     uni_status_text, _, _ = uni_status(snapshot)
     print("Uniswap LP:")
     print(f"  Token ID:       {format_uni_ids(snapshot.get('uni_position_ids'))}")
@@ -965,8 +1279,9 @@ def run_data_fetch() -> bool:
     print(f"  USDT:           {number(snapshot.get('uni_usdt_amount'), 2)} USDT")
     print(f"  Position value: {money(snapshot.get('uni_position_value'))}")
     print(f"  Unclaimed fees: {money(snapshot.get('uni_fees_unclaimed'))}")
+    print(f"    WETH fees:    {number(snapshot.get('uni_weth_fees'), 6)} WETH")
+    print(f"    USDT fees:    {number(snapshot.get('uni_usdt_fees'), 2)} USDT")
 
-    init_db()
     insert_snapshot(snapshot)
     history = get_history(30)
     generate_dashboard(snapshot, history)
@@ -1009,7 +1324,11 @@ def start_server() -> tuple[socketserver.TCPServer, int]:
 
 
 def main() -> int:
-    if not run_data_fetch():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gas", type=float, default=0.0, help="ETH spent on gas since last run")
+    args = parser.parse_args()
+
+    if not run_data_fetch(args.gas):
         return 1
 
     try:

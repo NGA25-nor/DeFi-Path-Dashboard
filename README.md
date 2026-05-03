@@ -39,11 +39,38 @@ LP_WALLET   = "0xYOUR_WALLET_HERE"   # wallet with Uniswap LP positions
 > If you use the same wallet for both AAVE and Uniswap, use the same address in both fields.
 
 ```bash
-# 4. Run
+# 4. Make the launcher clickable (one time only)
+chmod +x start.command
+
+# 5. Run
 python3 tracker.py
 ```
 
 Dashboard opens automatically at `http://localhost:5050`. That's it. 🎉
+
+---
+
+## Daily use
+
+**Option A — Double-click (easiest)**
+Double-click `start.command` in Finder. Terminal opens and the dashboard loads automatically.
+
+Want it on your Desktop?
+```bash
+ln -s /path/to/defi-tracker/start.command ~/Desktop/DeFi\ Tracker.command
+```
+
+**Option B — Terminal**
+```bash
+cd defi-tracker
+source venv/bin/activate
+python3 tracker.py
+```
+
+**Option C — Refresh button**
+If `tracker.py` is already running, just click **⟳ Refresh** in the browser to fetch new data without opening Terminal.
+
+Press `Ctrl+C` in Terminal to stop the server when you're done.
 
 ---
 
@@ -53,7 +80,7 @@ Dashboard opens automatically at `http://localhost:5050`. That's it. 🎉
 - Tracks AAVE V3 collateral, debt, health factor, and liquidation prices
 - Tracks Uniswap V3 LP positions — value, token amounts, unclaimed fees, range status
 - Calculates correlated liquidation risk (what % market drop triggers liquidation)
-- Saves daily snapshots to a local SQLite database
+- Saves one snapshot per run to a local SQLite database
 - Generates a dark-theme dashboard with charts, opens in your browser
 - Includes a **⟳ Refresh** button — no need to open Terminal after first run
 
@@ -77,33 +104,16 @@ brew install python
 
 ---
 
-## Daily use
-
-Every time you want an updated snapshot:
-
-```bash
-cd defi-tracker
-source venv/bin/activate
-python3 tracker.py
-```
-
-Or just click **⟳ Refresh** in the browser if `tracker.py` is already running.
-
-Press `Ctrl+C` in Terminal to stop the server when you're done.
-
----
-
 ## What the dashboard shows
 
 | Section | Description |
 |---|---|
 | Health banner | Health Factor with green/amber/red status |
 | KPI grid | ETH price, BTC price, collateral, debt, balances |
-| Liq Price ETH | Price at which your ETH collateral triggers liquidation (isolated) |
-| Liq Price BTC | Price at which your WBTC collateral triggers liquidation (isolated) |
-| Market Drop to Liq | % drop in both ETH+BTC that triggers liquidation (correlated) |
-| Liquidation Risk Summary | All liq prices + buffers in one place |
+| Market Drop to Liq | % drop in both ETH+BTC that triggers liquidation |
+| Liquidation Risk card | One clear scenario — how far market must fall + prices at liquidation |
 | Uniswap V3 Position | Pool, token amounts, value, unclaimed fees, in/out of range |
+| Range bar | Visual price range with current price marker |
 | Chart 1 | 30-day total equity trend |
 | Chart 2 | AAVE health factor over time |
 | Chart 3 | LTV% over time |
@@ -112,13 +122,20 @@ Press `Ctrl+C` in Terminal to stop the server when you're done.
 
 ---
 
-## Understanding liquidation prices
-
-**Liq Price ETH / Liq Price BTC (isolated)**
-What price would ETH (or BTC) need to fall to in order to trigger liquidation, assuming the other asset stays constant. May show N/A if the other collateral alone covers your debt.
+## Understanding liquidation risk
 
 **Market Drop to Liq (correlated)**
-The most useful metric. ETH and BTC tend to fall together — this shows what % both assets must drop simultaneously before you get liquidated. Green > 35%, Amber 20–35%, Red < 20%.
+ETH and BTC tend to fall together. This shows what % both assets must drop simultaneously before you get liquidated.
+
+- 🟢 Green / SAFE: drop > 35%
+- 🟡 Amber / WATCH: drop 20–35%
+- 🔴 Red / DANGER: drop < 20%
+
+---
+
+## How data is stored
+
+Each run saves one row to a local SQLite database (`data/portfolio.db`). Charts improve as more days accumulate. Run it daily for the best historical view.
 
 ---
 
@@ -138,6 +155,7 @@ The most useful metric. ETH and BTC tend to fall together — this shows what % 
 defi-tracker/
 ├── tracker.py          # main script — fetch, store, serve dashboard
 ├── db.py               # SQLite helper
+├── start.command       # double-click launcher for Mac
 ├── dashboard.html      # generated on each run (not in git)
 ├── config.py           # your wallet addresses (not in git)
 ├── config.example.py   # template — copy this to config.py
@@ -162,6 +180,11 @@ cp config.example.py config.py
 # then open config.py and add your wallet addresses
 ```
 
+**`start.command` won't open**
+```bash
+chmod +x start.command
+```
+
 **Dashboard not loading**
 Make sure `tracker.py` is running in Terminal. The browser needs the local server active at `http://localhost:5050` (or 5051/5052 if 5050 is busy).
 
@@ -172,7 +195,7 @@ The public RPC endpoint may be temporarily unavailable. Try again in a few minut
 Cross-check at [aavescan.com](https://aavescan.com) by searching your wallet address.
 
 **Old Uniswap positions showing up**
-Uniswap V3 NFTs stay in your wallet even after you remove liquidity. Closed positions (liquidity = 0) are shown but excluded from value calculations.
+Uniswap V3 NFTs stay in your wallet even after you remove liquidity. Closed positions (liquidity = 0) are labeled separately and excluded from value and range calculations.
 
 ---
 

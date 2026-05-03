@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
     correlated_liq_drop_pct  REAL,
     correlated_liq_price_eth REAL,
     correlated_liq_price_btc REAL,
+    eth_supply_apy      REAL,
+    usdt_borrow_apy     REAL,
+    aave_daily_carry    REAL,
+    uni_daily_fee_yield REAL,
+    gas_eth             REAL,
+    gas_usd             REAL,
+    gas_drag_pct        REAL,
+    total_daily_yield   REAL,
     total_equity    REAL,
     notes           TEXT
 );
@@ -64,6 +72,14 @@ MIGRATIONS = (
     ("uni_tick_lower", "INTEGER"),
     ("uni_tick_upper", "INTEGER"),
     ("uni_current_tick", "INTEGER"),
+    ("eth_supply_apy", "REAL"),
+    ("usdt_borrow_apy", "REAL"),
+    ("aave_daily_carry", "REAL"),
+    ("uni_daily_fee_yield", "REAL"),
+    ("gas_eth", "REAL"),
+    ("gas_usd", "REAL"),
+    ("gas_drag_pct", "REAL"),
+    ("total_daily_yield", "REAL"),
 )
 
 
@@ -96,6 +112,14 @@ COLUMNS = (
     "correlated_liq_drop_pct",
     "correlated_liq_price_eth",
     "correlated_liq_price_btc",
+    "eth_supply_apy",
+    "usdt_borrow_apy",
+    "aave_daily_carry",
+    "uni_daily_fee_yield",
+    "gas_eth",
+    "gas_usd",
+    "gas_drag_pct",
+    "total_daily_yield",
     "total_equity",
     "notes",
 )
