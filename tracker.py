@@ -50,6 +50,7 @@ POSITIONS_SELECTOR = "0x99fbab88"
 SLOT0_SELECTOR = "0x3850c7bd"
 Q96 = 2**96
 Q128 = 2**128
+Q256 = 2**256
 RAY = 1e27
 UNISWAP_V3_SUBGRAPH_ID = "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
 
@@ -336,23 +337,23 @@ def compute_fees_from_subgraph(position: dict[str, Any], eth_price: float | None
             fb0 = fo0_lower
             fb1 = fo1_lower
         else:
-            fb0 = (fg0 - fo0_lower) % Q128
-            fb1 = (fg1 - fo1_lower) % Q128
+            fb0 = (fg0 - fo0_lower) % Q256
+            fb1 = (fg1 - fo1_lower) % Q256
 
         if current_tick < tick_upper_idx:
             fa0 = fo0_upper
             fa1 = fo1_upper
         else:
-            fa0 = (fg0 - fo0_upper) % Q128
-            fa1 = (fg1 - fo1_upper) % Q128
+            fa0 = (fg0 - fo0_upper) % Q256
+            fa1 = (fg1 - fo1_upper) % Q256
 
-        fg_inside0 = (fg0 - fb0 - fa0) % Q128
-        fg_inside1 = (fg1 - fb1 - fa1) % Q128
+        fg_inside0 = (fg0 - fb0 - fa0) % Q256
+        fg_inside1 = (fg1 - fb1 - fa1) % Q256
 
         token0_decimals = int(position["token0"]["decimals"])
         token1_decimals = int(position["token1"]["decimals"])
-        amount0 = (liquidity * ((fg_inside0 - fi0) % Q128)) / Q128 / (10**token0_decimals)
-        amount1 = (liquidity * ((fg_inside1 - fi1) % Q128)) / Q128 / (10**token1_decimals)
+        amount0 = (liquidity * ((fg_inside0 - fi0) % Q256)) / Q128 / (10**token0_decimals)
+        amount1 = (liquidity * ((fg_inside1 - fi1) % Q256)) / Q128 / (10**token1_decimals)
 
         token0_symbol = position["token0"]["symbol"]
         token1_symbol = position["token1"]["symbol"]
@@ -453,6 +454,7 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
         total_fees += fee_usd
         token0_symbol = subgraph_position["token0"]["symbol"]
         token1_symbol = subgraph_position["token1"]["symbol"]
+        print(f"  Subgraph token order for #{subgraph_position['id']}: token0={token0_symbol}, token1={token1_symbol}")
         if token0_symbol in ("WETH", "ETH"):
             total_weth_fees += amount0
         elif token0_symbol in ("USDT", "USDC", "DAI"):
@@ -1278,9 +1280,15 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print(f"  WETH:           {number(snapshot.get('uni_weth_amount'), 4)} ETH")
     print(f"  USDT:           {number(snapshot.get('uni_usdt_amount'), 2)} USDT")
     print(f"  Position value: {money(snapshot.get('uni_position_value'))}")
-    print(f"  Unclaimed fees: {money(snapshot.get('uni_fees_unclaimed'))}")
-    print(f"    WETH fees:    {number(snapshot.get('uni_weth_fees'), 6)} WETH")
-    print(f"    USDT fees:    {number(snapshot.get('uni_usdt_fees'), 2)} USDT")
+    weth_fee_usd = (
+        snapshot["uni_weth_fees"] * snapshot["eth_price"]
+        if snapshot.get("uni_weth_fees") is not None and snapshot.get("eth_price") is not None
+        else None
+    )
+    print("Unclaimed fees:")
+    print(f"  USDT fees:  {number(snapshot.get('uni_usdt_fees'), 2)} USDT  ({money(snapshot.get('uni_usdt_fees'))})")
+    print(f"  WETH fees:  {number(snapshot.get('uni_weth_fees'), 6)} WETH  ({money(weth_fee_usd)})")
+    print(f"  Total:      {money(snapshot.get('uni_fees_unclaimed'))}")
 
     insert_snapshot(snapshot)
     history = get_history(30)
