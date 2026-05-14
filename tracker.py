@@ -20,6 +20,10 @@ try:
     from config import GRAPH_API_KEY
 except ImportError:
     GRAPH_API_KEY = None
+try:
+    from config import CURRENT_STAGE
+except ImportError:
+    CURRENT_STAGE = "Stage 1"
 from db import get_history, init_db, insert_snapshot
 
 
@@ -40,6 +44,8 @@ ETH_USD_FEED = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
 BTC_USD_FEED = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
 ETH_LIQ_THRESHOLD = 0.825
 BTC_LIQ_THRESHOLD = 0.750
+ETH_MAX_LTV = 0.80
+WBTC_MAX_LTV = 0.70
 
 LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 BALANCE_OF_SELECTOR = "0x70a08231"
@@ -56,6 +62,7 @@ UNISWAP_V3_SUBGRAPH_ID = "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
 
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_PATH = BASE_DIR / "dashboard.html"
+DB_FILE = BASE_DIR / "data" / "portfolio.db"
 REQUEST_TIMEOUT = 20
 
 
@@ -503,6 +510,18 @@ def percent(value: float | None, digits: int = 1) -> str:
     return f"{value:,.{digits}f}%"
 
 
+def signed_percent(value: float | None, digits: int = 1) -> str:
+    if value is None:
+        return "Need more data"
+    return f"{value:+,.{digits}f}%"
+
+
+def apy_value(value: float | None) -> str:
+    if value is None:
+        return "Not enough data"
+    return percent(value, 1)
+
+
 def signed_drop(value: float | None) -> str:
     if value is None:
         return "N/A"
@@ -610,6 +629,68 @@ def compute_snapshot(
         if gas_usd is not None and total_daily_yield > 0:
             gas_drag_pct = (gas_usd / total_daily_yield) * 100
 
+    stable_value_usd = raw.get("uni_usdt_amount")
+    # TODO: extend stable_buffer to include wallet stables + supplied stables on AAVE
+    stable_buffer_pct = (
+        stable_value_usd / total_equity * 100
+        if stable_value_usd is not None and total_equity and total_equity > 0
+        else 0
+    )
+    max_borrow_capacity, weighted_max_ltv = calc_weighted_borrow_capacity(
+        aweth_balance,
+        awbtc_balance,
+        eth_price,
+        btc_price,
+        collateral,
+    )
+    borrow_usage_pct = (
+        debt / max_borrow_capacity * 100
+        if debt is not None and max_borrow_capacity and max_borrow_capacity > 0
+        else 0
+    )
+    available_borrow = (
+        max(0, max_borrow_capacity - debt)
+        if debt is not None and max_borrow_capacity is not None
+        else None
+    )
+    current_farm_apy = (
+        uni_daily_fee_yield / uni_position_value * 365 * 100
+        if uni_daily_fee_yield is not None and uni_position_value and uni_position_value > 0
+        else 0
+    )
+    net_daily_yield = (
+        uni_daily_fee_yield + aave_daily_carry
+        if uni_daily_fee_yield is not None and aave_daily_carry is not None
+        else None
+    )
+    net_farm_apy = (
+        net_daily_yield / total_equity * 365 * 100
+        if net_daily_yield is not None and total_equity and total_equity > 0
+        else 0
+    )
+    apy_7d = calc_rolling_apy(DB_FILE, 7, uni_position_value)
+    apy_30d = calc_rolling_apy(DB_FILE, 30, uni_position_value)
+    in_range = raw.get("uni_in_range") == 1
+    farm_apy_quality = apy_quality(current_farm_apy, in_range, uni_position_value)
+    risk_state = calc_risk_state(raw.get("health_factor"), stable_buffer_pct, borrow_usage_pct)
+    coll_growth_30d, debt_growth_30d, flywheel_expansion = calc_flywheel(DB_FILE, 30)
+
+    eth_aave = aweth_balance or 0
+    eth_wallet = (eth_main or 0) + (eth_lp or 0)
+    eth_lp_amount = raw.get("uni_weth_amount") or 0
+    total_eth_units = eth_aave + eth_wallet + eth_lp_amount
+    total_eth_value = total_eth_units * eth_price if eth_price is not None else None
+    btc_aave = awbtc_balance or 0
+    total_btc_units = btc_aave
+    total_btc_value = total_btc_units * btc_price if btc_price is not None else None
+    # Stable position
+    stable_lp = raw.get("uni_usdt_amount") or 0  # USDT in active LP position
+    stable_debt = vdusdt_balance if vdusdt_balance and vdusdt_balance > 0 else debt or 0
+    # TODO: if USDC debt is added later, sum here: stable_debt += vdusdc_balance
+
+    stable_debt_usd = stable_debt  # USDT is 1:1 USD
+    net_stable = stable_lp - stable_debt_usd
+
     return {
         "timestamp": timestamp,
         "eth_price": eth_price,
@@ -654,6 +735,35 @@ def compute_snapshot(
         "gas_drag_pct": gas_drag_pct,
         "total_daily_yield": total_daily_yield,
         "total_equity": total_equity,
+        "stable_value_usd": stable_value_usd,
+        "stable_buffer_pct": stable_buffer_pct,
+        "weighted_max_ltv": weighted_max_ltv,
+        "max_borrow_capacity": max_borrow_capacity,
+        "borrow_usage_pct": borrow_usage_pct,
+        "current_farm_apy": current_farm_apy,
+        "net_daily_yield": net_daily_yield,
+        "net_farm_apy": net_farm_apy,
+        "apy_7d": apy_7d,
+        "apy_30d": apy_30d,
+        "apy_quality": farm_apy_quality,
+        "risk_state": risk_state,
+        "coll_growth_30d": coll_growth_30d,
+        "debt_growth_30d": debt_growth_30d,
+        "flywheel_expansion": flywheel_expansion,
+        "available_borrow": available_borrow,
+        "eth_aave": eth_aave,
+        "eth_wallet": eth_wallet,
+        "eth_lp_amount": eth_lp_amount,
+        "total_eth_units": total_eth_units,
+        "total_eth_value": total_eth_value,
+        "btc_aave": btc_aave,
+        "total_btc_units": total_btc_units,
+        "total_btc_value": total_btc_value,
+        "stable_lp": stable_lp,
+        "stable_debt": stable_debt,
+        "stable_debt_usd": stable_debt_usd,
+        "net_stable": net_stable,
+        "current_stage": CURRENT_STAGE,
         "notes": raw.get("notes"),
     }
 
@@ -661,9 +771,9 @@ def compute_snapshot(
 def health_class(health_factor: float | None) -> str:
     if health_factor is None:
         return "muted"
-    if health_factor >= 1.5:
+    if health_factor >= 1.8:
         return "green"
-    if health_factor >= 1.2:
+    if health_factor >= 1.6:
         return "amber"
     return "red"
 
@@ -726,24 +836,217 @@ def whole_money(value: float | None) -> str:
     return f"${value:,.0f}"
 
 
+def calc_weighted_borrow_capacity(
+    aweth_balance: float | None,
+    awbtc_balance: float | None,
+    eth_price: float | None,
+    btc_price: float | None,
+    aave_collateral: float | None,
+) -> tuple[float | None, float | None]:
+    if aave_collateral is None:
+        return None, None
+
+    eth_collateral_usd = (
+        aweth_balance * eth_price
+        if None not in (aweth_balance, eth_price)
+        else 0
+    )
+    btc_collateral_usd = (
+        awbtc_balance * btc_price
+        if None not in (awbtc_balance, btc_price)
+        else 0
+    )
+    total_collateral_usd = eth_collateral_usd + btc_collateral_usd
+
+    if total_collateral_usd > 0:
+        weighted_max_ltv = (
+            (eth_collateral_usd * ETH_MAX_LTV)
+            + (btc_collateral_usd * WBTC_MAX_LTV)
+        ) / total_collateral_usd
+    else:
+        weighted_max_ltv = 0.75
+
+    return aave_collateral * weighted_max_ltv, weighted_max_ltv
+
+
+def calc_rolling_apy(db_path: Path, days: int, current_lp_value: float | None) -> float | None:
+    """Calculate rolling average farm APY from last N snapshots."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT uni_daily_fee_yield FROM daily_snapshots "
+            "WHERE uni_daily_fee_yield IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (days,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if len(rows) < 2:
+            return None
+        avg_daily = sum(row[0] for row in rows) / len(rows)
+        return (avg_daily / current_lp_value * 365 * 100) if current_lp_value and current_lp_value > 0 else None
+    except Exception:
+        return None
+
+
+def apy_quality(current_farm_apy: float | None, in_range: bool, uni_position_value: float | None) -> str:
+    current_farm_apy = current_farm_apy or 0
+    if not uni_position_value or uni_position_value < 100:
+        return "Distorted"
+    if not in_range:
+        return "Weak"
+    if current_farm_apy > 80:
+        return "Distorted"
+    if current_farm_apy > 30:
+        return "Strong"
+    if current_farm_apy > 10:
+        return "Normal"
+    return "Weak"
+
+
+def calc_risk_state(hf, stable_buffer_pct, borrow_usage_pct):
+    hf = hf or 0
+    stable_buffer_pct = stable_buffer_pct or 0
+    borrow_usage_pct = borrow_usage_pct or 0
+
+    # Overextended: hard risk triggers only
+    if hf < 1.60 or borrow_usage_pct > 85:
+        return "Overextended"
+
+    # Aggressive: moderate risk on any dimension
+    if hf < 1.80 or borrow_usage_pct >= 70:
+        return "Aggressive"
+
+    # At this point: HF >= 1.80 AND borrow_usage < 70
+    # Defensive requires strong stable buffer too
+    if stable_buffer_pct >= 25:
+        return "Defensive"
+
+    # Balanced: good HF and borrow usage, but low stable buffer
+    return "Balanced"
+
+
+def calc_flywheel(db_path: Path, days: int = 30) -> tuple[float | None, float | None, float | None]:
+    """Calculate collateral and debt growth over last N snapshots."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT aave_collateral, aave_debt FROM daily_snapshots "
+            "WHERE aave_collateral IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (days,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if len(rows) < 2:
+            return None, None, None
+        oldest = rows[-1]
+        newest = rows[0]
+        coll_growth = (newest[0] - oldest[0]) / oldest[0] * 100 if oldest[0] else 0
+        debt_growth = (newest[1] - oldest[1]) / oldest[1] * 100 if oldest[1] else 0
+        net_expansion = coll_growth - debt_growth
+        return coll_growth, debt_growth, net_expansion
+    except Exception:
+        return None, None, None
+
+
+def metric_class(value: float | None, green_at: float, amber_at: float, lower_is_better: bool = False) -> str:
+    if value is None:
+        return "muted"
+    if lower_is_better:
+        if value < green_at:
+            return "green"
+        if value <= amber_at:
+            return "amber"
+        return "red"
+    if value >= green_at:
+        return "green"
+    if value >= amber_at:
+        return "amber"
+    return "red"
+
+
+def risk_state_class(risk_state: str) -> str:
+    return {
+        "Defensive": "green",
+        "Balanced": "blue",
+        "Aggressive": "amber",
+        "Overextended": "red",
+    }.get(risk_state, "muted")
+
+
+def risk_state_subtitle(risk_state: str, stable_buffer_pct: float | None) -> str:
+    if risk_state == "Balanced" and (stable_buffer_pct or 0) < 25:
+        return "Balanced · LP stable buffer low"
+    if risk_state == "Defensive":
+        return "HF + Borrow + Buffer all strong"
+    if risk_state == "Aggressive":
+        return "One or more risk dimensions elevated"
+    if risk_state == "Overextended":
+        return "HF or borrow usage at critical level"
+    return "HF + Buffer + Borrow"
+
+
+def build_risk_alerts(snapshot: dict[str, Any]) -> list[tuple[str, str]]:
+    alerts = []
+    hf = snapshot.get("health_factor")
+    if hf is not None and hf < 1.60:
+        alerts.append(("red", "⚠️ Health Factor is critically low. Consider adding collateral immediately."))
+    elif hf is not None and hf < 1.80:
+        alerts.append(("amber", "Health Factor is below target (1.80). Monitor closely and avoid new borrowing."))
+    if snapshot.get("stable_buffer_pct") is not None and snapshot["stable_buffer_pct"] < 25:
+        alerts.append(("amber", "Stable buffer is below 25%. Consider strengthening stable reserves."))
+    if snapshot.get("borrow_usage_pct") is not None and snapshot["borrow_usage_pct"] > 85:
+        alerts.append(("amber", "Borrow usage is above 85%. Avoid new borrowing until collateral improves."))
+    if snapshot.get("uni_in_range") == 0:
+        alerts.append(("amber", "Uniswap LP is out of range. Fees have stopped accruing."))
+    if snapshot.get("gas_drag_pct") is not None and snapshot["gas_drag_pct"] > 20:
+        alerts.append(("amber", "Gas costs are consuming more than 20% of daily yield."))
+    if (
+        snapshot.get("aave_daily_carry") is not None
+        and snapshot.get("uni_daily_fee_yield") is not None
+        and snapshot["aave_daily_carry"] < 0
+        and abs(snapshot["aave_daily_carry"]) > snapshot["uni_daily_fee_yield"]
+    ):
+        alerts.append(("amber", "AAVE borrow cost exceeds LP fee income. Net yield is negative."))
+    return alerts
+
+
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
     labels = [row["timestamp"][:10] for row in history]
     total_equity = [row.get("total_equity") for row in history]
-    health_factors = [row.get("health_factor") for row in history]
     ltv_values = [row.get("ltv_pct") for row in history]
-    eth_prices = [row.get("eth_price") for row in history]
-    uni_values = [row.get("uni_position_value") for row in history]
     fee_yields = [row.get("uni_daily_fee_yield") for row in history]
     aave_carries = [row.get("aave_daily_carry") for row in history]
     cumulative_fee_yields = []
+    cumulative_aave_carries = []
+    cumulative_net_outputs = []
+    total_eth_exposures = []
+    total_btc_exposures = []
     running_fees = 0.0
-    for value in fee_yields:
-        running_fees += value or 0
+    running_aave = 0.0
+    for row, fee_value, carry_value in zip(history, fee_yields, aave_carries):
+        running_fees += fee_value or 0
+        running_aave += carry_value or 0
         cumulative_fee_yields.append(running_fees)
-    health_colors = [
-        "#34d399" if value is not None and value >= 1.5 else "#fbbf24" if value is not None and value >= 1.2 else "#f87171"
-        for value in health_factors
-    ]
+        cumulative_aave_carries.append(running_aave)
+        cumulative_net_outputs.append(running_fees + running_aave)
+        total_eth_exposures.append(
+            (row.get("aweth_balance") or 0)
+            + (row.get("eth_main") or 0)
+            + (row.get("eth_lp") or 0)
+            + (row.get("uni_weth_amount") or 0)
+        )
+        total_btc_exposures.append(row.get("awbtc_balance"))
+    show_unit_chart = any(value is not None for value in total_btc_exposures) or any(
+        value for value in total_eth_exposures
+    )
 
     hf = snapshot.get("health_factor")
     banner_class = health_class(hf)
@@ -762,6 +1065,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         else None
     )
     risk_label, risk_class = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
+    risk_display = risk_label.title()
     carry_class = "green" if (snapshot.get("aave_daily_carry") or 0) >= 0 else "red"
     gas_row = ""
     if snapshot.get("gas_usd") is not None and snapshot.get("gas_usd") > 0:
@@ -782,6 +1086,37 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
                 ),
             )
     liquidation_equity_threshold = snapshot.get("aave_debt")
+    stable_class = metric_class(snapshot.get("stable_buffer_pct"), 25, 15)
+    borrow_usage_class = metric_class(snapshot.get("borrow_usage_pct"), 70, 85, lower_is_better=True)
+    risk_state_color = risk_state_class(snapshot.get("risk_state", ""))
+    risk_state_note = risk_state_subtitle(snapshot.get("risk_state", ""), snapshot.get("stable_buffer_pct"))
+    risk_alerts = build_risk_alerts(snapshot)
+    risk_alerts_html = ""
+    if risk_alerts:
+        alert_items = "\n".join(
+            f'      <div class="alert {alert_class}">{escape(message)}</div>'
+            for alert_class, message in risk_alerts
+        )
+        risk_alerts_html = f"""
+    <section class="alerts">
+{alert_items}
+    </section>
+"""
+    net_stable_class = "green" if (snapshot.get("net_stable") or 0) > 0 else "red"
+    lp_stable_pct = (
+        snapshot["uni_usdt_amount"] / snapshot["uni_position_value"] * 100
+        if snapshot.get("uni_usdt_amount") is not None
+        and snapshot.get("uni_position_value")
+        and snapshot["uni_position_value"] > 0
+        else None
+    )
+    cumulative_lp_fees = cumulative_fee_yields[-1] if cumulative_fee_yields else None
+    cumulative_aave_carry = cumulative_aave_carries[-1] if cumulative_aave_carries else None
+    cumulative_net_output = cumulative_net_outputs[-1] if cumulative_net_outputs else None
+    unit_chart_html = ""
+    if show_unit_chart:
+        unit_chart_html = """
+      <div class="card"><h2>Unit Accumulation Over Time</h2><div class="chart-wrap"><canvas id="unitAccumulationChart"></canvas></div><div class="subvalue">Includes LP exposure; LP assets may be used to repay debt.</div></div>"""
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -848,6 +1183,20 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       border-radius: 8px;
       padding: 18px;
     }}
+    .section-title {{ margin: 26px 0 14px; font-size: 18px; font-weight: 760; }}
+    .alerts {{ display: grid; gap: 10px; margin-bottom: 20px; }}
+    .alert {{
+      background: rgba(251, 191, 36, 0.06);
+      border: 1px solid var(--amber);
+      border-left-width: 5px;
+      border-radius: 8px;
+      padding: 13px 16px;
+      color: var(--text);
+    }}
+    .alert.red {{
+      background: rgba(248, 113, 113, 0.08);
+      border-color: var(--red);
+    }}
     .banner {{
       display: grid;
       grid-template-columns: repeat(3, 1fr);
@@ -869,8 +1218,18 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .risk-lead {{ font-size: 32px; font-weight: 760; margin-bottom: 4px; }}
     .risk-copy {{ color: var(--muted); margin-bottom: 16px; }}
     .risk-status {{ margin-top: 14px; font-weight: 720; }}
+    .health-grid {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
+    .compact-risk {{ border-left: 5px solid var(--muted); }}
+    .compact-risk.green {{ border-left-color: var(--green); }}
+    .compact-risk.amber {{ border-left-color: var(--amber); }}
+    .compact-risk.red {{ border-left-color: var(--red); }}
+    .mini-list {{ display: grid; gap: 5px; margin-top: 8px; font-size: 12px; color: var(--muted); }}
+    .mini-list strong {{ color: var(--text); font-weight: 700; }}
     .uni-card {{ margin-top: 20px; }}
     .uni-grid {{ display: grid; grid-template-columns: 160px 1fr; gap: 9px 14px; }}
+    .active-farm {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
+    .farm-panel {{ min-width: 0; }}
+    .farm-panel h3 {{ margin: 0 0 12px; font-size: 15px; }}
     .status-dot {{ display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 7px; background: var(--muted); }}
     .status-dot.green {{ background: var(--green); }}
     .status-dot.red {{ background: var(--red); }}
@@ -906,7 +1265,23 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     }}
     .label {{ color: var(--muted); font-size: 13px; }}
     .value {{ margin-top: 4px; font-size: 24px; font-weight: 720; }}
+    .subvalue {{ margin-top: 7px; color: var(--muted); font-size: 12px; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
+    .grid.five {{ grid-template-columns: repeat(5, minmax(0, 1fr)); }}
+    .grid.three {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+    .context-row {{
+      margin: -4px 0 20px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: rgba(129, 140, 248, 0.06);
+    }}
+    .placeholder {{
+      white-space: pre-line;
+      color: var(--muted);
+      line-height: 1.7;
+    }}
     .kpi .value {{ font-size: 20px; }}
     .charts {{ display: grid; gap: 20px; margin-bottom: 20px; }}
     .chart-wrap {{ height: 320px; }}
@@ -917,12 +1292,13 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .two-col {{ display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }}
     .green {{ color: var(--green); }}
     .red {{ color: var(--red); }}
+    .blue {{ color: var(--blue); }}
     .amber {{ color: var(--amber); }}
     .indigo {{ color: var(--indigo); }}
     footer {{ margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }}
     @media (max-width: 820px) {{
       main {{ width: min(100% - 20px, 1180px); padding: 20px 0; }}
-      .grid, .banner, .two-col {{ grid-template-columns: 1fr; }}
+      .grid, .grid.five, .grid.three, .health-grid, .active-farm, .banner, .two-col {{ grid-template-columns: 1fr; }}
       header {{ display: block; }}
       .refresh-btn {{ margin-top: 12px; }}
       h1 {{ font-size: 26px; }}
@@ -940,74 +1316,91 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <button class="refresh-btn" onclick="refreshData()">&#10227; Refresh</button>
     </header>
     <div class="toast" id="toast">Start tracker.py in Terminal first</div>
+{risk_alerts_html}
 
-    <section class="card banner {banner_class}">
-      <div><div class="label">Health Factor</div><div class="value">{number(hf, 3)}</div></div>
-      <div><div class="label">Equity</div><div class="value">{money(snapshot.get("total_equity"))}</div></div>
-      <div><div class="label">LTV</div><div class="value">{number(snapshot.get("ltv_pct"))}%</div></div>
+    <h2 class="section-title">SYSTEM HEALTH</h2>
+    <section class="health-grid">
+      <div class="card kpi"><div class="label">Health Factor</div><div class="value {banner_class}">{number(hf, 3)}</div><div class="subvalue">Target &ge;1.80 &middot; Floor 1.60</div></div>
+      <div class="card kpi"><div class="label">LP Stable Buffer</div><div class="value {stable_class}">{percent(snapshot.get("stable_buffer_pct"), 1)}</div><div class="subvalue">Currently counts USDT inside active LP only.</div></div>
+      <div class="card kpi"><div class="label">Borrow Usage</div><div class="value {borrow_usage_class}">{percent(snapshot.get("borrow_usage_pct"), 1)}</div><div class="subvalue">Capacity {whole_money(snapshot.get("max_borrow_capacity"))} &middot; Used {whole_money(snapshot.get("aave_debt"))}</div></div>
+      <div class="card kpi"><div class="label">Current Stage</div><div class="value indigo">{escape(snapshot.get("current_stage") or CURRENT_STAGE)}</div><div class="subvalue">DeFi Path</div></div>
+      <div class="card kpi"><div class="label">Risk State</div><div class="value {risk_state_color}">{escape(snapshot.get("risk_state", "N/A"))}</div><div class="subvalue">{escape(risk_state_note)}</div></div>
+      <div class="card kpi compact-risk {risk_class}"><div class="label">Liquidation Risk</div><div class="value {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div><div class="mini-list"><span>ETH liq <strong>{whole_money(snapshot.get("correlated_liq_price_eth"))}</strong></span><span>BTC liq <strong>{whole_money(snapshot.get("correlated_liq_price_btc"))}</strong></span><span>Status <strong class="{risk_class}">{escape(risk_display)}</strong></span></div></div>
     </section>
 
+    <h2 class="section-title">ACTIVE FARM</h2>
+    <section class="active-farm">
+      <div class="card farm-panel">
+        <h3>Farm Status</h3>
+        <div class="uni-grid">
+          <div class="label">Pair</div><div>WETH / USDT 0.3%</div>
+          <div class="label">Status</div><div class="{uni_status_class}"><span class="status-dot {uni_dot_class}"></span>{escape(uni_status_text)}</div>
+          <div class="label">Current price</div><div>{whole_money(snapshot.get("eth_price"))}</div>
+          <div class="label">Range</div><div>{whole_money(snapshot.get("uni_price_lower"))} - {whole_money(snapshot.get("uni_price_upper"))}</div>
+          <div class="label">Position value</div><div>{money(snapshot.get("uni_position_value"))}</div>
+          <div class="label">Active ID</div><div>{escape(active_ids)}</div>
+        </div>
+      </div>
+      <div class="card farm-panel">
+        <h3>APY / Output</h3>
+        <div class="uni-grid">
+          <div class="label">Current Farm APY</div><div class="green">{percent(snapshot.get("current_farm_apy"), 1)}</div>
+          <div class="label">7d APY</div><div>{apy_value(snapshot.get("apy_7d"))}</div>
+          <div class="label">30d APY</div><div>{apy_value(snapshot.get("apy_30d"))}</div>
+          <div class="label">Daily LP fees</div><div>{money(snapshot.get("uni_daily_fee_yield"))}</div>
+          <div class="label">Cumulative LP fees</div><div>{money(cumulative_lp_fees)}</div>
+          <div class="label">Cumulative AAVE carry</div><div>{money(cumulative_aave_carry)}</div>
+          <div class="label">Total cumulative net</div><div>{money(cumulative_net_output)}</div>
+          <div class="label">Unclaimed fees</div><div>{money(snapshot.get("uni_fees_unclaimed"))}</div>
+        </div>
+      </div>
+      <div class="card farm-panel">
+        <h3>Composition</h3>
+        <div class="uni-grid">
+          <div class="label">ETH amount</div><div>{number(snapshot.get("uni_weth_amount"), 4)} ETH <span class="muted">({money(uni_weth_value)})</span></div>
+          <div class="label">USDT amount</div><div>{number(snapshot.get("uni_usdt_amount"), 2)} USDT</div>
+          <div class="label">LP stable %</div><div>{percent(lp_stable_pct, 1)}</div>
+          <div class="label">APY quality</div><div>{escape(snapshot.get("apy_quality", "N/A"))}</div>
+        </div>
+        <div class="range-caption">ETH/USDT 0.3% &middot; {escape(uni_status_text)}</div>
+        <div class="range-labels"><span>{whole_money(snapshot.get("uni_price_lower"))}</span><span>{whole_money(snapshot.get("uni_price_upper"))}</span></div>
+        <div class="range-bar" style="--range-position: {range_position:.2f}%"><span class="range-dot"></span></div>
+        <div class="range-now">{whole_money(snapshot.get("eth_price"))}</div>
+      </div>
+    </section>
+    <div class="context-row">APY {percent(snapshot.get("current_farm_apy"), 1)} &nbsp; | &nbsp; HF {number(hf, 3)} &nbsp; | &nbsp; Borrow Usage {percent(snapshot.get("borrow_usage_pct"), 1)} &nbsp; | &nbsp; Stable Buffer {percent(snapshot.get("stable_buffer_pct"), 1)}</div>
+
+    <h2 class="section-title">FLYWHEEL STRENGTH</h2>
     <section class="grid">
-      <div class="card kpi"><div class="label">Total Equity</div><div class="value">{money(snapshot.get("total_equity"))}</div></div>
-      <div class="card kpi"><div class="label">ETH Price</div><div class="value">{money(snapshot.get("eth_price"))}</div></div>
-      <div class="card kpi"><div class="label">BTC Price</div><div class="value">{money(snapshot.get("btc_price"))}</div></div>
-      <div class="card kpi"><div class="label">Health Factor</div><div class="value">{number(hf, 3)}</div></div>
-      <div class="card kpi"><div class="label">AAVE Collateral</div><div class="value">{money(snapshot.get("aave_collateral"))}</div></div>
-      <div class="card kpi"><div class="label">AAVE Debt</div><div class="value">{money(snapshot.get("aave_debt"))}</div></div>
-      <div class="card kpi"><div class="label">aWETH Balance</div><div class="value">{number(snapshot.get("aweth_balance"), 6)}</div></div>
-      <div class="card kpi"><div class="label">vdUSDT Balance</div><div class="value">{number(snapshot.get("vdusdt_balance"), 2)}</div></div>
-      <div class="card kpi"><div class="label">aWBTC Balance</div><div class="value">{number(snapshot.get("awbtc_balance"), 8)} BTC</div></div>
-      <div class="card kpi"><div class="label">Market Drop to Liq</div><div class="value {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div></div>
-      <div class="card kpi"><div class="label">LP Position Value</div><div class="value">{money(snapshot.get("uni_position_value"))}</div></div>
-      <div class="card kpi"><div class="label">Unclaimed Fees</div><div class="value amber">{money(snapshot.get("uni_fees_unclaimed"))}</div></div>
-      <div class="card kpi"><div class="label">ETH Supply APY</div><div class="value green">{percent(snapshot.get("eth_supply_apy"), 2)}</div></div>
-      <div class="card kpi"><div class="label">USDT Borrow APY</div><div class="value red">{percent(snapshot.get("usdt_borrow_apy"), 2)}</div></div>
-      <div class="card kpi"><div class="label">Daily Carry</div><div class="value {carry_class}">{money(snapshot.get("aave_daily_carry"))}</div></div>
-      <div class="card kpi"><div class="label">Daily Fee Yield</div><div class="value amber">{money(snapshot.get("uni_daily_fee_yield"))}</div></div>
-      <div class="card kpi"><div class="label">Total Daily Yield</div><div class="value green">{money(snapshot.get("total_daily_yield"))}</div></div>
+      <div class="card kpi"><div class="label">Collateral Growth 30d</div><div class="value">{signed_percent(snapshot.get("coll_growth_30d"))}</div></div>
+      <div class="card kpi"><div class="label">Debt Growth 30d</div><div class="value">{signed_percent(snapshot.get("debt_growth_30d"))}</div></div>
+      <div class="card kpi"><div class="label">Net Flywheel Expansion</div><div class="value">{signed_percent(snapshot.get("flywheel_expansion"))}</div></div>
+      <div class="card kpi"><div class="label">Available Borrow Optionality</div><div class="value indigo">{money(snapshot.get("available_borrow"))}</div><div class="subvalue">Optionality, not target</div></div>
+    </section>
+
+    <h2 class="section-title">UNIT ACCUMULATION</h2>
+    <section class="grid three">
+      <div class="card kpi"><div class="label">Total ETH Exposure</div><div class="value">{number(snapshot.get("total_eth_units"), 4)} ETH <span class="muted">({money(snapshot.get("total_eth_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("eth_aave"), 4)} permanent core collateral<br>LP exposure: {number(snapshot.get("eth_lp_amount"), 4)} active farm exposure, funded by borrowed stables<br>Wallet: {number(snapshot.get("eth_wallet"), 4)}</div></div>
+      <div class="card kpi"><div class="label">Total BTC Exposure</div><div class="value">{number(snapshot.get("total_btc_units"), 6)} BTC <span class="muted">({money(snapshot.get("total_btc_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("btc_aave"), 6)} permanent core collateral<br>LP BTC exposure: 0.000000 active farm exposure</div></div>
+      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables minus AAVE stable debt<br>LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}</div></div>
     </section>
 {gas_row}
 
-    <section class="card risk-box {risk_class}">
-      <h2>LIQUIDATION RISK</h2>
-      <div class="risk-lead {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div>
-      <div class="risk-copy">Market must fall before you are liquidated</div>
-      <div class="risk-grid">
-        <div class="label">At that point:</div><div></div>
-        <div class="label">ETH would be at</div><div><strong>{whole_money(snapshot.get("correlated_liq_price_eth"))}</strong></div>
-        <div class="label">BTC would be at</div><div><strong>{whole_money(snapshot.get("correlated_liq_price_btc"))}</strong></div>
-        <div class="label">Current ETH</div><div>{whole_money(snapshot.get("eth_price"))}</div>
-        <div class="label">Current BTC</div><div>{whole_money(snapshot.get("btc_price"))}</div>
-      </div>
-      <div class="risk-status {risk_class}"><span class="status-dot {risk_class}"></span>{risk_label}</div>
-    </section>
-
-    <section class="card uni-card">
-      <h2>UNISWAP V3 POSITION</h2>
-      <div class="uni-grid">
-        <div class="label">Pool:</div><div>WETH / USDT 0.3%</div>
-        <div class="label">Active:</div><div>{escape(active_ids)}</div>
-        <div class="label">Closed:</div><div>{escape(closed_ids)}</div>
-        <div class="label">Status:</div><div class="{uni_status_class}"><span class="status-dot {uni_dot_class}"></span>{escape(uni_status_text)}</div>
-        <div class="label">WETH:</div><div>{number(snapshot.get("uni_weth_amount"), 4)} ETH <span class="muted">({money(uni_weth_value)})</span></div>
-        <div class="label">USDT:</div><div>{number(snapshot.get("uni_usdt_amount"), 2)} USDT <span class="muted">({money(snapshot.get("uni_usdt_amount"))})</span></div>
-        <div class="label">Total value:</div><div>{money(snapshot.get("uni_position_value"))}</div>
-        <div class="label">Unclaimed fees:</div><div>{money(snapshot.get("uni_fees_unclaimed"))}</div>
-        <div class="label">Range:</div><div>{whole_money(snapshot.get("uni_price_lower"))} - {whole_money(snapshot.get("uni_price_upper"))} <span class="muted">(current {whole_money(snapshot.get("eth_price"))})</span></div>
-      </div>
-      <div class="range-caption">ETH/USDT 0.3% &middot; {escape(uni_status_text)} &middot; 10 days active</div>
-      <div class="range-labels"><span>{whole_money(snapshot.get("uni_price_lower"))}</span><span>{whole_money(snapshot.get("uni_price_upper"))}</span></div>
-      <div class="range-bar" style="--range-position: {range_position:.2f}%"><span class="range-dot"></span></div>
-      <div class="range-now">{whole_money(snapshot.get("eth_price"))}</div>
-    </section>
-
+    <h2 class="section-title">CORE CHARTS</h2>
     <section class="charts">
-      <div class="card"><h2>30-day Total Equity trend</h2><div class="chart-wrap"><canvas id="equityChart"></canvas></div></div>
-      <div class="card"><h2>AAVE Health Factor over time</h2><div class="chart-wrap"><canvas id="hfChart"></canvas></div></div>
-      <div class="card"><h2>LTV% over time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
-      <div class="card"><h2>Uniswap LP Position Value</h2><div class="chart-wrap"><canvas id="uniValueChart"></canvas></div></div>
+      <div class="card"><h2>Total Equity Trend</h2><div class="chart-wrap"><canvas id="equityChart"></canvas></div></div>
+      <div class="card"><h2>LTV Over Time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
       <div class="card"><h2>Daily Yield Breakdown</h2><div class="chart-wrap"><canvas id="dailyYieldChart"></canvas></div></div>
-      <div class="card"><h2>Cumulative LP Fees Earned</h2><div class="chart-wrap"><canvas id="cumulativeFeesChart"></canvas></div></div>
+      <div class="card"><h2>Cumulative Farm Output</h2><div class="chart-wrap"><canvas id="cumulativeFarmOutputChart"></canvas></div></div>
+{unit_chart_html}
+    </section>
+
+    <h2 class="section-title">STRATEGY vs HODL</h2>
+    <section class="card">
+      <div class="placeholder">Baseline not configured yet.
+Add BASELINE_ETH, BASELINE_BTC
+and BASELINE_STABLES to
+config.py to enable this.</div>
     </section>
 
     <section class="two-col">
@@ -1016,6 +1409,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         <table>
           <thead><tr><th>Position</th><th>Metric 1</th><th>Metric 2</th><th>Metric 3</th><th>Metric 4</th></tr></thead>
           <tbody>
+            <tr><td>Portfolio</td><td>{money(snapshot.get("total_equity"))} total equity</td><td>{money(snapshot.get("eth_price"))} ETH</td><td>{money(snapshot.get("btc_price"))} BTC</td><td>{money(snapshot.get("total_daily_yield"))} daily yield</td></tr>
             <tr><td>AAVE</td><td>{money(snapshot.get("aave_collateral"))} collateral</td><td>{money(snapshot.get("aave_debt"))} debt</td><td>{money(snapshot.get("aave_equity"))} equity</td><td>HF {number(hf, 3)} | LTV {number(snapshot.get("ltv_pct"))}%</td></tr>
             <tr><td>ETH Balances</td><td>{number(snapshot.get("eth_main"), 6)} main</td><td>{number(snapshot.get("eth_lp"), 6)} LP</td><td>{number(eth_total, 6)} total ETH</td><td>{money(eth_value)}</td></tr>
           </tbody>
@@ -1046,14 +1440,15 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
 
     const labels = {js_json(labels)};
     const equity = {js_json(total_equity)};
-    const healthFactors = {js_json(health_factors)};
-    const healthColors = {js_json(health_colors)};
     const ltvValues = {js_json(ltv_values)};
-    const ethPrices = {js_json(eth_prices)};
-    const uniValues = {js_json(uni_values)};
     const feeYields = {js_json(fee_yields)};
     const aaveCarries = {js_json(aave_carries)};
     const cumulativeFeeYields = {js_json(cumulative_fee_yields)};
+    const cumulativeAaveCarries = {js_json(cumulative_aave_carries)};
+    const cumulativeNetOutputs = {js_json(cumulative_net_outputs)};
+    const totalEthExposures = {js_json(total_eth_exposures)};
+    const totalBtcExposures = {js_json(total_btc_exposures)};
+    const showUnitChart = {js_json(show_unit_chart)};
     const liquidationEquityThreshold = {js_json(liquidation_equity_threshold)};
 
     const gridColor = "#262a33";
@@ -1107,24 +1502,11 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       plugins: [linePlugin("equityLiqThreshold", liquidationEquityThreshold, "#f87171", "Liq threshold")]
     }});
 
-    new Chart(document.getElementById("hfChart"), {{
-      type: "line",
-      data: {{ labels, datasets: [{{ data: healthFactors, borderColor: "#34d399", pointBackgroundColor: healthColors, segment: {{ borderColor: ctx => healthColors[ctx.p1DataIndex] || "#34d399" }}, tension: 0.25, spanGaps: true }}] }},
-      options: commonOptions,
-      plugins: [linePlugin("hfWarning", 1.2, "#f87171")]
-    }});
-
     new Chart(document.getElementById("ltvChart"), {{
       type: "bar",
       data: {{ labels, datasets: [{{ data: ltvValues, backgroundColor: "#fbbf24" }}] }},
       options: commonOptions,
       plugins: [linePlugin("ltvWarning", 80, "#f87171")]
-    }});
-
-    new Chart(document.getElementById("uniValueChart"), {{
-      type: "line",
-      data: {{ labels, datasets: [{{ data: uniValues, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, spanGaps: true }}] }},
-      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: formatUSD }} }} }} }}
     }});
 
     new Chart(document.getElementById("dailyYieldChart"), {{
@@ -1146,12 +1528,13 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       }}
     }});
 
-    new Chart(document.getElementById("cumulativeFeesChart"), {{
+    new Chart(document.getElementById("cumulativeFarmOutputChart"), {{
       data: {{
         labels,
         datasets: [
-          {{ type: "bar", label: "Daily Fee Yield", data: feeYields, backgroundColor: "#fbbf24", yAxisID: "y" }},
-          {{ type: "line", label: "Cumulative Fees", data: cumulativeFeeYields, borderColor: "#f59e0b", backgroundColor: "rgba(251, 191, 36, 0.15)", tension: 0.25, yAxisID: "y1" }}
+          {{ type: "line", label: "Cumulative LP Fees", data: cumulativeFeeYields, borderColor: "#fbbf24", backgroundColor: "rgba(251, 191, 36, 0.15)", tension: 0.25, yAxisID: "y" }},
+          {{ type: "line", label: "Cumulative AAVE Carry", data: cumulativeAaveCarries, borderColor: "#818cf8", backgroundColor: "rgba(129, 140, 248, 0.12)", tension: 0.25, yAxisID: "y" }},
+          {{ type: "line", label: "Total Cumulative Net Output", data: cumulativeNetOutputs, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, yAxisID: "y" }}
         ]
       }},
       options: {{
@@ -1160,11 +1543,33 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
         scales: {{
           x: {{ ticks: {{ color: textColor }}, grid: {{ color: gridColor }} }},
-          y: {{ position: "left", ticks: {{ color: textColor, callback: formatUSD }}, grid: {{ color: gridColor }} }},
-          y1: {{ position: "right", ticks: {{ color: textColor, callback: formatUSD }}, grid: {{ drawOnChartArea: false }} }}
+          y: {{ ticks: {{ color: textColor, callback: formatUSD }}, grid: {{ color: gridColor }} }}
         }}
       }}
     }});
+
+    if (showUnitChart) {{
+      new Chart(document.getElementById("unitAccumulationChart"), {{
+        type: "line",
+        data: {{
+          labels,
+          datasets: [
+            {{ label: "Total ETH Exposure", data: totalEthExposures, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, spanGaps: true, yAxisID: "y" }},
+            {{ label: "Total BTC Exposure", data: totalBtcExposures, borderColor: "#fbbf24", backgroundColor: "rgba(251, 191, 36, 0.12)", tension: 0.25, spanGaps: true, yAxisID: "y1" }}
+          ]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {{ legend: {{ display: true, labels: {{ color: textColor }} }} }},
+          scales: {{
+            x: {{ ticks: {{ color: textColor }}, grid: {{ color: gridColor }} }},
+            y: {{ position: "left", ticks: {{ color: textColor }}, grid: {{ color: gridColor }} }},
+            y1: {{ position: "right", ticks: {{ color: textColor }}, grid: {{ drawOnChartArea: false }} }}
+          }}
+        }}
+      }});
+    }}
   </script>
 </body>
 </html>
