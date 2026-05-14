@@ -1,4 +1,4 @@
-# DeFi Portfolio Tracker
+# DeFi Path Dashboard
 
 A local, privacy-first Capital OS DeFi dashboard for AAVE V3 + Uniswap V3 positions on Ethereum mainnet.
 

@@ -166,6 +166,7 @@ def fetch_aave_user_data(wallet: str) -> dict[str, float]:
     return {
         "aave_collateral": collateral,
         "aave_debt": debt,
+        "aave_available_borrows": words[2] / 1e8,
         "health_factor": words[5] / 1e18,
     }
 
@@ -546,6 +547,7 @@ def compute_snapshot(
 ) -> dict[str, Any]:
     collateral = raw.get("aave_collateral")
     debt = raw.get("aave_debt")
+    aave_available_borrows = raw.get("aave_available_borrows")
     eth_main = raw.get("eth_main")
     eth_lp = raw.get("eth_lp")
     eth_price = raw.get("eth_price")
@@ -648,15 +650,12 @@ def compute_snapshot(
         if debt is not None and max_borrow_capacity and max_borrow_capacity > 0
         else 0
     )
-    available_borrow = (
-        max(0, max_borrow_capacity - debt)
+    remaining_borrow_room = (
+        max(0, aave_available_borrows)
+        if aave_available_borrows is not None
+        else max(0, max_borrow_capacity - debt)
         if debt is not None and max_borrow_capacity is not None
         else None
-    )
-    current_farm_apy = (
-        uni_daily_fee_yield / uni_position_value * 365 * 100
-        if uni_daily_fee_yield is not None and uni_position_value and uni_position_value > 0
-        else 0
     )
     net_daily_yield = (
         uni_daily_fee_yield + aave_daily_carry
@@ -670,6 +669,14 @@ def compute_snapshot(
     )
     apy_7d = calc_rolling_apy(DB_FILE, 7, uni_position_value)
     apy_30d = calc_rolling_apy(DB_FILE, 30, uni_position_value)
+    current_farm_apy_is_fallback = False
+    if uni_daily_fee_yield is not None and uni_daily_fee_yield > 0 and uni_position_value and uni_position_value > 0:
+        current_farm_apy = (uni_daily_fee_yield / uni_position_value) * 365 * 100
+    elif apy_7d is not None:
+        current_farm_apy = apy_7d
+        current_farm_apy_is_fallback = True
+    else:
+        current_farm_apy = 0.0
     in_range = raw.get("uni_in_range") == 1
     farm_apy_quality = apy_quality(current_farm_apy, in_range, uni_position_value)
     risk_state = calc_risk_state(raw.get("health_factor"), stable_buffer_pct, borrow_usage_pct)
@@ -699,6 +706,7 @@ def compute_snapshot(
         "eth_lp": eth_lp,
         "aave_collateral": collateral,
         "aave_debt": debt,
+        "aave_available_borrows": aave_available_borrows,
         "aave_equity": aave_equity,
         "health_factor": raw.get("health_factor"),
         "ltv_pct": ltv_pct,
@@ -741,6 +749,7 @@ def compute_snapshot(
         "max_borrow_capacity": max_borrow_capacity,
         "borrow_usage_pct": borrow_usage_pct,
         "current_farm_apy": current_farm_apy,
+        "current_farm_apy_is_fallback": current_farm_apy_is_fallback,
         "net_daily_yield": net_daily_yield,
         "net_farm_apy": net_farm_apy,
         "apy_7d": apy_7d,
@@ -750,7 +759,7 @@ def compute_snapshot(
         "coll_growth_30d": coll_growth_30d,
         "debt_growth_30d": debt_growth_30d,
         "flywheel_expansion": flywheel_expansion,
-        "available_borrow": available_borrow,
+        "remaining_borrow_room": remaining_borrow_room,
         "eth_aave": eth_aave,
         "eth_wallet": eth_wallet,
         "eth_lp_amount": eth_lp_amount,
@@ -859,14 +868,16 @@ def calc_weighted_borrow_capacity(
     total_collateral_usd = eth_collateral_usd + btc_collateral_usd
 
     if total_collateral_usd > 0:
-        weighted_max_ltv = (
-            (eth_collateral_usd * ETH_MAX_LTV)
-            + (btc_collateral_usd * WBTC_MAX_LTV)
-        ) / total_collateral_usd
+        weighted_max_borrow = (
+            eth_collateral_usd * ETH_MAX_LTV
+            + btc_collateral_usd * WBTC_MAX_LTV
+        )
+        weighted_max_ltv = weighted_max_borrow / total_collateral_usd
     else:
+        weighted_max_borrow = aave_collateral * 0.75
         weighted_max_ltv = 0.75
 
-    return aave_collateral * weighted_max_ltv, weighted_max_ltv
+    return weighted_max_borrow, weighted_max_ltv
 
 
 def calc_rolling_apy(db_path: Path, days: int, current_lp_value: float | None) -> float | None:
@@ -1019,33 +1030,37 @@ def build_risk_alerts(snapshot: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
-    labels = [row["timestamp"][:10] for row in history]
-    total_equity = [row.get("total_equity") for row in history]
-    ltv_values = [row.get("ltv_pct") for row in history]
-    fee_yields = [row.get("uni_daily_fee_yield") for row in history]
-    aave_carries = [row.get("aave_daily_carry") for row in history]
-    cumulative_fee_yields = []
-    cumulative_aave_carries = []
-    cumulative_net_outputs = []
-    total_eth_exposures = []
-    total_btc_exposures = []
+    chart_rows = []
     running_fees = 0.0
     running_aave = 0.0
-    for row, fee_value, carry_value in zip(history, fee_yields, aave_carries):
+    for row in history:
+        fee_value = row.get("uni_daily_fee_yield")
+        carry_value = row.get("aave_daily_carry")
         running_fees += fee_value or 0
         running_aave += carry_value or 0
-        cumulative_fee_yields.append(running_fees)
-        cumulative_aave_carries.append(running_aave)
-        cumulative_net_outputs.append(running_fees + running_aave)
-        total_eth_exposures.append(
+        total_eth_exposure = (
             (row.get("aweth_balance") or 0)
             + (row.get("eth_main") or 0)
             + (row.get("eth_lp") or 0)
             + (row.get("uni_weth_amount") or 0)
         )
-        total_btc_exposures.append(row.get("awbtc_balance"))
-    show_unit_chart = any(value is not None for value in total_btc_exposures) or any(
-        value for value in total_eth_exposures
+        chart_rows.append(
+            {
+                "timestamp": row.get("timestamp"),
+                "total_equity": row.get("total_equity"),
+                "ltv_pct": row.get("ltv_pct"),
+                "uni_daily_fee_yield": fee_value,
+                "aave_daily_carry": carry_value,
+                "cumulative_lp_fees": running_fees,
+                "cumulative_aave_carry": running_aave,
+                "cumulative_net_output": running_fees + running_aave,
+                "total_eth_exposure": total_eth_exposure,
+                "total_btc_exposure": row.get("awbtc_balance"),
+                "uni_position_value": row.get("uni_position_value"),
+            }
+        )
+    show_unit_chart = any(row.get("total_btc_exposure") is not None for row in chart_rows) or any(
+        row.get("total_eth_exposure") for row in chart_rows
     )
 
     hf = snapshot.get("health_factor")
@@ -1110,20 +1125,25 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         and snapshot["uni_position_value"] > 0
         else None
     )
-    cumulative_lp_fees = cumulative_fee_yields[-1] if cumulative_fee_yields else None
-    cumulative_aave_carry = cumulative_aave_carries[-1] if cumulative_aave_carries else None
-    cumulative_net_output = cumulative_net_outputs[-1] if cumulative_net_outputs else None
+    cumulative_lp_fees = chart_rows[-1]["cumulative_lp_fees"] if chart_rows else None
+    cumulative_aave_carry = chart_rows[-1]["cumulative_aave_carry"] if chart_rows else None
+    cumulative_net_output = chart_rows[-1]["cumulative_net_output"] if chart_rows else None
     unit_chart_html = ""
     if show_unit_chart:
         unit_chart_html = """
       <div class="card"><h2>Unit Accumulation Over Time</h2><div class="chart-wrap"><canvas id="unitAccumulationChart"></canvas></div><div class="subvalue">Includes LP exposure; LP assets may be used to repay debt.</div></div>"""
+    farm_apy_note = (
+        '<div class="subvalue">(7d avg — no new fees today)</div>'
+        if snapshot.get("current_farm_apy_is_fallback")
+        else ""
+    )
 
     html = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DeFi Portfolio Tracker</title>
+  <title>DeFi Path Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {{
@@ -1310,7 +1330,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
   <main>
     <header>
       <div>
-        <h1>DeFi Portfolio Tracker</h1>
+        <h1>DeFi Path Dashboard</h1>
         <div class="subtitle">{escape(snapshot["timestamp"])} | MAIN {escape(truncated(MAIN_WALLET))} | LP {escape(truncated(LP_WALLET))}</div>
       </div>
       <button class="refresh-btn" onclick="refreshData()">&#10227; Refresh</button>
@@ -1344,7 +1364,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card farm-panel">
         <h3>APY / Output</h3>
         <div class="uni-grid">
-          <div class="label">Current Farm APY</div><div class="green">{percent(snapshot.get("current_farm_apy"), 1)}</div>
+          <div class="label">Current Farm APY</div><div class="green">{percent(snapshot.get("current_farm_apy"), 1)}{farm_apy_note}</div>
           <div class="label">7d APY</div><div>{apy_value(snapshot.get("apy_7d"))}</div>
           <div class="label">30d APY</div><div>{apy_value(snapshot.get("apy_30d"))}</div>
           <div class="label">Daily LP fees</div><div>{money(snapshot.get("uni_daily_fee_yield"))}</div>
@@ -1375,14 +1395,14 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">Collateral Growth 30d</div><div class="value">{signed_percent(snapshot.get("coll_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Debt Growth 30d</div><div class="value">{signed_percent(snapshot.get("debt_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Net Flywheel Expansion</div><div class="value">{signed_percent(snapshot.get("flywheel_expansion"))}</div></div>
-      <div class="card kpi"><div class="label">Available Borrow Optionality</div><div class="value indigo">{money(snapshot.get("available_borrow"))}</div><div class="subvalue">Optionality, not target</div></div>
+      <div class="card kpi"><div class="label">Borrow Room</div><div class="value indigo">{money(snapshot.get("remaining_borrow_room"))}</div><div class="subvalue">AAVE max LTV</div></div>
     </section>
 
     <h2 class="section-title">UNIT ACCUMULATION</h2>
     <section class="grid three">
       <div class="card kpi"><div class="label">Total ETH Exposure</div><div class="value">{number(snapshot.get("total_eth_units"), 4)} ETH <span class="muted">({money(snapshot.get("total_eth_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("eth_aave"), 4)} permanent core collateral<br>LP exposure: {number(snapshot.get("eth_lp_amount"), 4)} active farm exposure, funded by borrowed stables<br>Wallet: {number(snapshot.get("eth_wallet"), 4)}</div></div>
       <div class="card kpi"><div class="label">Total BTC Exposure</div><div class="value">{number(snapshot.get("total_btc_units"), 6)} BTC <span class="muted">({money(snapshot.get("total_btc_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("btc_aave"), 6)} permanent core collateral<br>LP BTC exposure: 0.000000 active farm exposure</div></div>
-      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables minus AAVE stable debt<br>LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}</div></div>
+      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}<br>Net stable: {money(snapshot.get("net_stable"))}</div></div>
     </section>
 {gas_row}
 
@@ -1390,6 +1410,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     <section class="charts">
       <div class="card"><h2>Total Equity Trend</h2><div class="chart-wrap"><canvas id="equityChart"></canvas></div></div>
       <div class="card"><h2>LTV Over Time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
+      <div class="card"><h2>Farm APY Trend</h2><div class="chart-wrap"><canvas id="farmApyTrendChart"></canvas></div><div class="subvalue">APY calculated from daily LP fee yield. Zero values indicate no fee change that day.</div></div>
       <div class="card"><h2>Daily Yield Breakdown</h2><div class="chart-wrap"><canvas id="dailyYieldChart"></canvas></div></div>
       <div class="card"><h2>Cumulative Farm Output</h2><div class="chart-wrap"><canvas id="cumulativeFarmOutputChart"></canvas></div></div>
 {unit_chart_html}
@@ -1417,7 +1438,7 @@ config.py to enable this.</div>
       </div>
     </section>
 
-    <footer>Generated: {escape(snapshot["timestamp"])} | Data: ethereum-rpc.publicnode.com | All data is read-only on-chain</footer>
+    <footer>DeFi Path Dashboard · Generated: {escape(snapshot["timestamp"])} | Data: ethereum-rpc.publicnode.com | All data is read-only on-chain</footer>
   </main>
 
   <script>
@@ -1438,16 +1459,7 @@ config.py to enable this.</div>
       }}
     }}
 
-    const labels = {js_json(labels)};
-    const equity = {js_json(total_equity)};
-    const ltvValues = {js_json(ltv_values)};
-    const feeYields = {js_json(fee_yields)};
-    const aaveCarries = {js_json(aave_carries)};
-    const cumulativeFeeYields = {js_json(cumulative_fee_yields)};
-    const cumulativeAaveCarries = {js_json(cumulative_aave_carries)};
-    const cumulativeNetOutputs = {js_json(cumulative_net_outputs)};
-    const totalEthExposures = {js_json(total_eth_exposures)};
-    const totalBtcExposures = {js_json(total_btc_exposures)};
+    const rows = {js_json(chart_rows)};
     const showUnitChart = {js_json(show_unit_chart)};
     const liquidationEquityThreshold = {js_json(liquidation_equity_threshold)};
 
@@ -1461,6 +1473,37 @@ config.py to enable this.</div>
         if (abs >= 1) return '$' + Math.round(value);
         return '$' + value.toFixed(2);
     }}
+    function formatPct(value) {{
+        if (value === null || value === undefined || isNaN(value)) return '';
+        return value.toFixed(1) + '%';
+    }}
+
+    // Deduplicate rows by date — keep last snapshot per day
+    function dedupeByDate(rows) {{
+        const seen = {{}};
+        rows.forEach(row => {{
+            if (!row.timestamp) return;
+            const date = row.timestamp.split('T')[0];
+            seen[date] = row;
+        }});
+        return Object.keys(seen).sort().map(date => seen[date]);
+    }}
+
+    const chartRows = dedupeByDate(rows);
+    const labels = chartRows.map(row => row.timestamp.split('T')[0]);
+    const equity = chartRows.map(row => row.total_equity);
+    const ltvValues = chartRows.map(row => row.ltv_pct);
+    const feeYields = chartRows.map(row => row.uni_daily_fee_yield);
+    const aaveCarries = chartRows.map(row => row.aave_daily_carry);
+    const cumulativeFeeYields = chartRows.map(row => row.cumulative_lp_fees);
+    const cumulativeAaveCarries = chartRows.map(row => row.cumulative_aave_carry);
+    const cumulativeNetOutputs = chartRows.map(row => row.cumulative_net_output);
+    const totalEthExposures = chartRows.map(row => row.total_eth_exposure);
+    const totalBtcExposures = chartRows.map(row => row.total_btc_exposure);
+    const farmApyValues = chartRows.map(row => {{
+      if (row.uni_daily_fee_yield === null || row.uni_daily_fee_yield === undefined || !row.uni_position_value || row.uni_position_value <= 0) return null;
+      return (row.uni_daily_fee_yield / row.uni_position_value) * 365 * 100;
+    }});
 
     const linePlugin = (id, yValue, color, label) => ({{
       id,
@@ -1507,6 +1550,12 @@ config.py to enable this.</div>
       data: {{ labels, datasets: [{{ data: ltvValues, backgroundColor: "#fbbf24" }}] }},
       options: commonOptions,
       plugins: [linePlugin("ltvWarning", 80, "#f87171")]
+    }});
+
+    new Chart(document.getElementById("farmApyTrendChart"), {{
+      type: "line",
+      data: {{ labels, datasets: [{{ data: farmApyValues, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, spanGaps: true }}] }},
+      options: {{ ...commonOptions, scales: {{ ...commonOptions.scales, y: {{ ...commonOptions.scales.y, ticks: {{ color: textColor, callback: formatPct }} }} }} }}
     }});
 
     new Chart(document.getElementById("dailyYieldChart"), {{
