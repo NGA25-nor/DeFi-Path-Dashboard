@@ -15,8 +15,8 @@ Runs entirely on your own machine. No server. No cloud. No subscription.
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/NGA25-nor/defi-tracker
-cd defi-tracker
+git clone https://github.com/NGA25-nor/DeFi-Path-Dashboard
+cd DeFi-Path-Dashboard
 
 # 2. Create virtual environment and install dependencies
 python3 -m venv venv
@@ -54,7 +54,7 @@ Dashboard opens at `http://localhost:5050`. That's it. 🎉
 
 Or from Terminal:
 ```bash
-cd defi-tracker
+cd DeFi-Path-Dashboard
 source venv/bin/activate
 python3 tracker.py
 ```
@@ -110,7 +110,7 @@ Combined Uniswap V3 position + APY view:
 - Collateral growth 30d
 - Debt growth 30d
 - Net flywheel expansion (collateral growth − debt growth)
-- Available borrow optionality
+- Borrow Room (remaining capacity from AAVE)
 
 ### Unit Accumulation
 - Total ETH exposure (AAVE + wallet + LP)
@@ -120,9 +120,10 @@ Combined Uniswap V3 position + APY view:
 ### Core Charts
 1. Total Equity Trend
 2. LTV Over Time
-3. Daily Yield Breakdown (LP fees + AAVE carry)
-4. Cumulative Farm Output
-5. Unit Accumulation Over Time (ETH + BTC)
+3. Farm APY Trend
+4. Daily Yield Breakdown (LP fees + AAVE carry)
+5. Cumulative Farm Output
+6. Unit Accumulation Over Time (ETH + BTC)
 
 ### Strategy vs HODL
 Placeholder — configure baseline in `config.py` to enable.
@@ -168,6 +169,7 @@ All calls are **read-only**. No private keys. No transactions.
 - Collateral, debt, equity, HF, LTV
 - Supply APY (WETH) and borrow APY (USDT)
 - Daily carry = supply income − borrow cost
+- Borrow Room = AAVE `availableBorrowsBase` from `getUserAccountData`
 
 **Liquidation:**
 - ETH liq price (isolated)
@@ -187,6 +189,7 @@ All calls are **read-only**. No private keys. No transactions.
 - Borrow usage = debt / (collateral × weighted max LTV)
 - Weighted max LTV: ETH 80%, WBTC 70%
 - Farm APY = daily fee yield / LP value × 365
+- Farm APY fallback = 7d average when today's yield is $0
 - Flywheel expansion = collateral growth % − debt growth %
 
 ---
@@ -203,7 +206,7 @@ All calls are **read-only**. No private keys. No transactions.
 ## Project structure
 
 ```
-defi-tracker/
+DeFi-Path-Dashboard/
 ├── tracker.py          # main script — fetch, calculate, store, serve
 ├── db.py               # SQLite helper
 ├── start.command       # double-click launcher (Mac)
