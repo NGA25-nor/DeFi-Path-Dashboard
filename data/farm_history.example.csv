@@ -1,0 +1,4 @@
+nft_id,pair,status,realized_weth,realized_wbtc,realized_usdt,realized_usdc,notes
+1147472,ETH/USDT,closed,0.000000,0.000000,0.00,0.00,Example old ETH/USDT farm
+1198334,BTC/USDT,closed,0.000000,0.000000,0.00,0.00,Example old BTC/USDT farm
+1269178,ETH/USDT,active,0.000000,0.000000,0.00,0.00,Current active farm realized fees only

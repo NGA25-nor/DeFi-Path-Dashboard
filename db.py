@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
     uni_position_ids TEXT,
     uni_position_value REAL,
     uni_fees_unclaimed REAL,
+    uni_weth_fees REAL,
+    uni_usdt_fees REAL,
     uni_weth_amount REAL,
     uni_usdt_amount REAL,
     uni_in_range INTEGER,
@@ -49,6 +51,10 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
     gas_usd             REAL,
     gas_drag_pct        REAL,
     total_daily_yield   REAL,
+    cumulative_realized_fees_usd REAL,
+    cumulative_realized_fees_eth REAL,
+    cumulative_realized_fees_usdt REAL,
+    cumulative_total_farm_output_usd REAL,
     total_equity    REAL,
     notes           TEXT
 );
@@ -66,6 +72,8 @@ MIGRATIONS = (
     ("uni_position_ids", "TEXT"),
     ("uni_position_value", "REAL"),
     ("uni_fees_unclaimed", "REAL"),
+    ("uni_weth_fees", "REAL"),
+    ("uni_usdt_fees", "REAL"),
     ("uni_weth_amount", "REAL"),
     ("uni_usdt_amount", "REAL"),
     ("uni_in_range", "INTEGER"),
@@ -80,6 +88,10 @@ MIGRATIONS = (
     ("gas_usd", "REAL"),
     ("gas_drag_pct", "REAL"),
     ("total_daily_yield", "REAL"),
+    ("cumulative_realized_fees_usd", "REAL"),
+    ("cumulative_realized_fees_eth", "REAL"),
+    ("cumulative_realized_fees_usdt", "REAL"),
+    ("cumulative_total_farm_output_usd", "REAL"),
 )
 
 
@@ -101,6 +113,8 @@ COLUMNS = (
     "uni_position_ids",
     "uni_position_value",
     "uni_fees_unclaimed",
+    "uni_weth_fees",
+    "uni_usdt_fees",
     "uni_weth_amount",
     "uni_usdt_amount",
     "uni_in_range",
@@ -120,6 +134,10 @@ COLUMNS = (
     "gas_usd",
     "gas_drag_pct",
     "total_daily_yield",
+    "cumulative_realized_fees_usd",
+    "cumulative_realized_fees_eth",
+    "cumulative_realized_fees_usdt",
+    "cumulative_total_farm_output_usd",
     "total_equity",
     "notes",
 )

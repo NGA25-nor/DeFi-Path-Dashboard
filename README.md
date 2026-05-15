@@ -70,6 +70,28 @@ Press `Ctrl+C` to stop the server.
 
 ---
 
+## Manual farm history CSV
+
+Optional, but recommended if you have closed/collected old farms.
+
+Create your own file from the example:
+```bash
+cp data/farm_history.example.csv data/farm_history.csv
+```
+
+Fill in one row per Uniswap NFT/farm:
+```csv
+nft_id,pair,status,realized_weth,realized_wbtc,realized_usdt,realized_usdc,notes
+1269178,ETH/USDT,active,0.0012,0,45.50,0,Collected fees from current farm
+1198334,BTC/USDT,closed,0,0.0004,28.00,0,Old BTC/USDT farm
+```
+
+Use realized/collected fees only. Current unclaimed fees are fetched live and added separately by `tracker.py`.
+
+If `data/farm_history.csv` is missing, the dashboard still runs and uses live/snapshot data only.
+
+---
+
 ## What the dashboard shows
 
 ### System Health

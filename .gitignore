@@ -1,5 +1,6 @@
 config.py
-data/
+data/*
+!data/farm_history.example.csv
 dashboard.html
 .DS_Store
 venv/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import http.server
 import json
 import math
@@ -8,7 +9,7 @@ import socketserver
 import sys
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,7 @@ UNISWAP_V3_SUBGRAPH_ID = "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
 BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_PATH = BASE_DIR / "dashboard.html"
 DB_FILE = BASE_DIR / "data" / "portfolio.db"
+FARM_HISTORY_FILE = BASE_DIR / "data" / "farm_history.csv"
 REQUEST_TIMEOUT = 20
 
 
@@ -499,6 +501,20 @@ def money(value: float | None) -> str:
     return f"${value:,.2f}"
 
 
+def signed_money(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):,.2f}"
+
+
+def signed_asset(value: float | None, symbol: str, digits: int = 6) -> str:
+    if value is None:
+        return "N/A"
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}{abs(value):,.{digits}f} {symbol}"
+
+
 def number(value: float | int | None, digits: int = 2) -> str:
     if value is None:
         return "N/A"
@@ -539,10 +555,91 @@ def js_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True).replace("</", "<\\/")
 
 
+def parse_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text.replace(",", "."))
+    except ValueError:
+        return 0.0
+
+
+def parse_nft_ids(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    return {
+        token.strip().lstrip("#")
+        for token in str(value).replace(";", ",").split(",")
+        if token.strip()
+    }
+
+
+def load_farm_history(path: Path = FARM_HISTORY_FILE) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    rows = []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                nft_id = (row.get("nft_id") or "").strip().lstrip("#")
+                if not nft_id:
+                    continue
+                rows.append(
+                    {
+                        "nft_id": nft_id,
+                        "pair": (row.get("pair") or "").strip(),
+                        "status": (row.get("status") or "").strip(),
+                        "realized_weth": parse_float(row.get("realized_weth")),
+                        "realized_wbtc": parse_float(row.get("realized_wbtc")),
+                        "realized_usdt": parse_float(row.get("realized_usdt")),
+                        "realized_usdc": parse_float(row.get("realized_usdc")),
+                        "notes": (row.get("notes") or "").strip(),
+                    }
+                )
+    except OSError:
+        return []
+    return rows
+
+
+def sum_farm_history(
+    rows: list[dict[str, Any]],
+    eth_price: float | None,
+    btc_price: float | None,
+    nft_ids: set[str] | None = None,
+) -> dict[str, float]:
+    selected_rows = [
+        row for row in rows
+        if nft_ids is None or row.get("nft_id") in nft_ids
+    ]
+    weth = sum(row.get("realized_weth") or 0 for row in selected_rows)
+    wbtc = sum(row.get("realized_wbtc") or 0 for row in selected_rows)
+    usdt = sum(row.get("realized_usdt") or 0 for row in selected_rows)
+    usdc = sum(row.get("realized_usdc") or 0 for row in selected_rows)
+    usd = usdt + usdc
+    if eth_price is not None:
+        usd += weth * eth_price
+    if btc_price is not None:
+        usd += wbtc * btc_price
+    return {
+        "weth": weth,
+        "wbtc": wbtc,
+        "usdt": usdt,
+        "usdc": usdc,
+        "usd": usd,
+        "rows": len(selected_rows),
+    }
+
+
 def compute_snapshot(
     raw: dict[str, Any],
     timestamp: str,
     previous_fees_usd: float | None = None,
+    previous_snapshot: dict[str, Any] | None = None,
     gas_eth: float = 0.0,
 ) -> dict[str, Any]:
     collateral = raw.get("aave_collateral")
@@ -559,6 +656,8 @@ def compute_snapshot(
     eth_supply_apy = raw.get("eth_supply_apy")
     usdt_borrow_apy = raw.get("usdt_borrow_apy")
     uni_fees_unclaimed = raw.get("uni_fees_unclaimed")
+    uni_weth_fees = raw.get("uni_weth_fees")
+    uni_usdt_fees = raw.get("uni_usdt_fees")
 
     aave_equity = collateral - debt if collateral is not None and debt is not None else None
     ltv_pct = (debt / collateral) * 100 if collateral and debt is not None else None
@@ -575,6 +674,9 @@ def compute_snapshot(
     correlated_liq_price_eth = None
     correlated_liq_price_btc = None
     aave_daily_carry = None
+    aave_daily_supply_income = None
+    aave_daily_borrow_cost = None
+    daily_financing_carry = None
     uni_daily_fee_yield = 0.0 if previous_fees_usd is None else None
     gas_usd = gas_eth * eth_price if eth_price is not None else None
     gas_drag_pct = 0.0
@@ -615,10 +717,19 @@ def compute_snapshot(
             correlated_liq_price_eth = eth_price * (1 - correlated_liq_drop_pct / 100)
             correlated_liq_price_btc = btc_price * (1 - correlated_liq_drop_pct / 100)
 
-    if None not in (aweth_balance, eth_price, eth_supply_apy, vdusdt_balance, usdt_borrow_apy):
+    stable_borrow_principal = (
+        vdusdt_balance
+        if vdusdt_balance is not None and vdusdt_balance > 0
+        else debt
+    )
+    if None not in (aweth_balance, eth_price, eth_supply_apy, stable_borrow_principal, usdt_borrow_apy):
+        aave_daily_supply_income = aweth_balance * eth_price * (eth_supply_apy / 100) / 365
+        aave_daily_borrow_cost = stable_borrow_principal * (usdt_borrow_apy / 100) / 365
+        # Financing carry is the estimated daily cost of borrowed stables used to fund the farm.
+        daily_financing_carry = -aave_daily_borrow_cost
         aave_daily_carry = (
-            aweth_balance * eth_price * (eth_supply_apy / 100) / 365
-        ) - (vdusdt_balance * (usdt_borrow_apy / 100) / 365)
+            aave_daily_supply_income
+        ) - aave_daily_borrow_cost
 
     if uni_fees_unclaimed is not None:
         if previous_fees_usd is None:
@@ -626,8 +737,8 @@ def compute_snapshot(
         else:
             uni_daily_fee_yield = max(0.0, uni_fees_unclaimed - previous_fees_usd)
 
-    if aave_daily_carry is not None and uni_daily_fee_yield is not None:
-        total_daily_yield = aave_daily_carry + uni_daily_fee_yield
+    if daily_financing_carry is not None and uni_daily_fee_yield is not None:
+        total_daily_yield = daily_financing_carry + uni_daily_fee_yield
         if gas_usd is not None and total_daily_yield > 0:
             gas_drag_pct = (gas_usd / total_daily_yield) * 100
 
@@ -658,8 +769,8 @@ def compute_snapshot(
         else None
     )
     net_daily_yield = (
-        uni_daily_fee_yield + aave_daily_carry
-        if uni_daily_fee_yield is not None and aave_daily_carry is not None
+        uni_daily_fee_yield + daily_financing_carry
+        if uni_daily_fee_yield is not None and daily_financing_carry is not None
         else None
     )
     net_farm_apy = (
@@ -670,7 +781,12 @@ def compute_snapshot(
     apy_7d = calc_rolling_apy(DB_FILE, 7, uni_position_value)
     apy_30d = calc_rolling_apy(DB_FILE, 30, uni_position_value)
     current_farm_apy_is_fallback = False
-    if uni_daily_fee_yield is not None and uni_daily_fee_yield > 0 and uni_position_value and uni_position_value > 0:
+    if (
+        uni_daily_fee_yield is not None
+        and uni_daily_fee_yield >= 0.01
+        and uni_position_value
+        and uni_position_value > 0
+    ):
         current_farm_apy = (uni_daily_fee_yield / uni_position_value) * 365 * 100
     elif apy_7d is not None:
         current_farm_apy = apy_7d
@@ -678,7 +794,7 @@ def compute_snapshot(
     else:
         current_farm_apy = 0.0
     in_range = raw.get("uni_in_range") == 1
-    farm_apy_quality = apy_quality(current_farm_apy, in_range, uni_position_value)
+    farm_apy_quality = apy_quality(current_farm_apy, in_range, uni_position_value, apy_7d)
     risk_state = calc_risk_state(raw.get("health_factor"), stable_buffer_pct, borrow_usage_pct)
     coll_growth_30d, debt_growth_30d, flywheel_expansion = calc_flywheel(DB_FILE, 30)
 
@@ -697,6 +813,48 @@ def compute_snapshot(
 
     stable_debt_usd = stable_debt  # USDT is 1:1 USD
     net_stable = stable_lp - stable_debt_usd
+    prev_realized_usd = (previous_snapshot or {}).get("cumulative_realized_fees_usd") or 0
+    prev_realized_eth = (previous_snapshot or {}).get("cumulative_realized_fees_eth") or 0
+    prev_realized_usdt = (previous_snapshot or {}).get("cumulative_realized_fees_usdt") or 0
+    prev_unclaimed_usd = (previous_snapshot or {}).get("uni_fees_unclaimed")
+    prev_unclaimed_eth = (previous_snapshot or {}).get("uni_weth_fees")
+    prev_unclaimed_usdt = (previous_snapshot or {}).get("uni_usdt_fees")
+    uni_daily_weth_fee_yield = (
+        max(0.0, uni_weth_fees - prev_unclaimed_eth)
+        if uni_weth_fees is not None and prev_unclaimed_eth is not None
+        else 0.0 if uni_weth_fees is not None else None
+    )
+    uni_daily_usdt_fee_yield = (
+        max(0.0, uni_usdt_fees - prev_unclaimed_usdt)
+        if uni_usdt_fees is not None and prev_unclaimed_usdt is not None
+        else 0.0 if uni_usdt_fees is not None else None
+    )
+
+    realized_fee_delta_usd = 0.0
+    realized_fee_delta_eth = 0.0
+    realized_fee_delta_usdt = 0.0
+    if prev_unclaimed_usd is not None and uni_fees_unclaimed is not None and uni_fees_unclaimed < prev_unclaimed_usd:
+        realized_fee_delta_usd = prev_unclaimed_usd - uni_fees_unclaimed
+    if prev_unclaimed_eth is not None and uni_weth_fees is not None and uni_weth_fees < prev_unclaimed_eth:
+        realized_fee_delta_eth = prev_unclaimed_eth - uni_weth_fees
+    if prev_unclaimed_usdt is not None and uni_usdt_fees is not None and uni_usdt_fees < prev_unclaimed_usdt:
+        realized_fee_delta_usdt = prev_unclaimed_usdt - uni_usdt_fees
+
+    cumulative_realized_fees_usd = prev_realized_usd + realized_fee_delta_usd
+    cumulative_realized_fees_eth = prev_realized_eth + realized_fee_delta_eth
+    cumulative_realized_fees_usdt = prev_realized_usdt + realized_fee_delta_usdt
+    prev_total_output = (previous_snapshot or {}).get("cumulative_total_farm_output_usd")
+    prev_borrow_carry = (
+        prev_total_output
+        - prev_realized_usd
+        - (prev_unclaimed_usd or 0)
+        if prev_total_output is not None
+        else 0
+    )
+    cumulative_borrow_carry = prev_borrow_carry + (daily_financing_carry or 0)
+    cumulative_total_farm_output_usd = (
+        cumulative_realized_fees_usd + (uni_fees_unclaimed or 0) + cumulative_borrow_carry
+    )
 
     return {
         "timestamp": timestamp,
@@ -718,9 +876,9 @@ def compute_snapshot(
         "uni_active_position_ids": raw.get("uni_active_position_ids"),
         "uni_closed_position_ids": raw.get("uni_closed_position_ids"),
         "uni_position_value": uni_position_value,
-        "uni_fees_unclaimed": raw.get("uni_fees_unclaimed"),
-        "uni_weth_fees": raw.get("uni_weth_fees"),
-        "uni_usdt_fees": raw.get("uni_usdt_fees"),
+        "uni_fees_unclaimed": uni_fees_unclaimed,
+        "uni_weth_fees": uni_weth_fees,
+        "uni_usdt_fees": uni_usdt_fees,
         "uni_weth_amount": raw.get("uni_weth_amount"),
         "uni_usdt_amount": raw.get("uni_usdt_amount"),
         "uni_in_range": raw.get("uni_in_range"),
@@ -737,11 +895,20 @@ def compute_snapshot(
         "eth_supply_apy": eth_supply_apy,
         "usdt_borrow_apy": usdt_borrow_apy,
         "aave_daily_carry": aave_daily_carry,
+        "aave_daily_supply_income": aave_daily_supply_income,
+        "aave_daily_borrow_cost": aave_daily_borrow_cost,
+        "daily_financing_carry": daily_financing_carry,
         "uni_daily_fee_yield": uni_daily_fee_yield,
+        "uni_daily_weth_fee_yield": uni_daily_weth_fee_yield,
+        "uni_daily_usdt_fee_yield": uni_daily_usdt_fee_yield,
         "gas_eth": gas_eth,
         "gas_usd": gas_usd,
         "gas_drag_pct": gas_drag_pct,
         "total_daily_yield": total_daily_yield,
+        "cumulative_realized_fees_usd": cumulative_realized_fees_usd,
+        "cumulative_realized_fees_eth": cumulative_realized_fees_eth,
+        "cumulative_realized_fees_usdt": cumulative_realized_fees_usdt,
+        "cumulative_total_farm_output_usd": cumulative_total_farm_output_usd,
         "total_equity": total_equity,
         "stable_value_usd": stable_value_usd,
         "stable_buffer_pct": stable_buffer_pct,
@@ -881,29 +1048,45 @@ def calc_weighted_borrow_capacity(
 
 
 def calc_rolling_apy(db_path: Path, days: int, current_lp_value: float | None) -> float | None:
-    """Calculate rolling average farm APY from last N snapshots."""
+    """Calculate rolling average farm APY from the last N calendar-day snapshots."""
     import sqlite3
 
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute(
-            "SELECT uni_daily_fee_yield FROM daily_snapshots "
+            "SELECT timestamp, uni_daily_fee_yield FROM daily_snapshots "
             "WHERE uni_daily_fee_yield IS NOT NULL "
-            "ORDER BY id DESC LIMIT ?",
-            (days,),
+            "ORDER BY id DESC",
         )
         rows = cur.fetchall()
         conn.close()
-        if len(rows) < 2:
+
+        latest_by_date = {}
+        for timestamp, daily_yield in rows:
+            if not timestamp:
+                continue
+            date = timestamp.split("T")[0]
+            if date not in latest_by_date:
+                latest_by_date[date] = daily_yield
+            if len(latest_by_date) >= days:
+                break
+
+        daily_values = list(latest_by_date.values())
+        if len(daily_values) < 2:
             return None
-        avg_daily = sum(row[0] for row in rows) / len(rows)
+        avg_daily = sum(daily_values) / len(daily_values)
         return (avg_daily / current_lp_value * 365 * 100) if current_lp_value and current_lp_value > 0 else None
     except Exception:
         return None
 
 
-def apy_quality(current_farm_apy: float | None, in_range: bool, uni_position_value: float | None) -> str:
+def apy_quality(
+    current_farm_apy: float | None,
+    in_range: bool,
+    uni_position_value: float | None,
+    apy_7d: float | None = None,
+) -> str:
     current_farm_apy = current_farm_apy or 0
     if not uni_position_value or uni_position_value < 100:
         return "Distorted"
@@ -911,11 +1094,12 @@ def apy_quality(current_farm_apy: float | None, in_range: bool, uni_position_val
         return "Weak"
     if current_farm_apy > 80:
         return "Distorted"
-    if current_farm_apy > 30:
+    quality_apy = apy_7d if apy_7d is not None else current_farm_apy
+    if quality_apy < 5:
+        return "Weak"
+    if quality_apy > 20:
         return "Strong"
-    if current_farm_apy > 10:
-        return "Normal"
-    return "Weak"
+    return "Normal"
 
 
 def calc_risk_state(hf, stable_buffer_pct, borrow_usage_pct):
@@ -1029,15 +1213,165 @@ def build_risk_alerts(snapshot: dict[str, Any]) -> list[tuple[str, str]]:
     return alerts
 
 
+def row_financing_carry(row: dict[str, Any]) -> float | None:
+    debt = row.get("vdusdt_balance")
+    if debt is None or debt <= 0:
+        debt = row.get("aave_debt")
+    borrow_apy = row.get("usdt_borrow_apy")
+    if debt is None or borrow_apy is None:
+        return None
+    return -(debt * (borrow_apy / 100) / 365)
+
+
+def calc_fee_accounting_seed(history: list[dict[str, Any]]) -> dict[str, float]:
+    realized_fees_usd = 0.0
+    previous_unclaimed = None
+    latest_unclaimed = 0.0
+    cumulative_borrow_carry = 0.0
+
+    for row in history:
+        unclaimed = row.get("uni_fees_unclaimed")
+        if previous_unclaimed is not None and unclaimed is not None and unclaimed < previous_unclaimed:
+            realized_fees_usd += previous_unclaimed - unclaimed
+        if unclaimed is not None:
+            previous_unclaimed = unclaimed
+            latest_unclaimed = unclaimed
+        carry = row.get("daily_financing_carry")
+        if carry is None:
+            carry = row_financing_carry(row)
+        cumulative_borrow_carry += carry or 0
+
+    return {
+        "cumulative_realized_fees_usd": realized_fees_usd,
+        "cumulative_realized_fees_eth": 0.0,
+        "cumulative_realized_fees_usdt": 0.0,
+        "cumulative_total_farm_output_usd": realized_fees_usd + latest_unclaimed + cumulative_borrow_carry,
+    }
+
+
+def same_active_farm(row: dict[str, Any], active_ids: str | None) -> bool:
+    row_ids = row.get("uni_active_position_ids")
+    if row_ids is None:
+        return True
+    return bool(active_ids and row_ids and row_ids == active_ids)
+
+
+def calc_active_farm_output(history: list[dict[str, Any]], snapshot: dict[str, Any]) -> dict[str, float | None]:
+    active_ids = snapshot.get("uni_active_position_ids")
+    farm_rows = [row for row in history if same_active_farm(row, active_ids)]
+    if not farm_rows:
+        farm_rows = [snapshot]
+
+    realized_usd = 0.0
+    realized_weth = 0.0
+    realized_usdt = 0.0
+    prev_usd = None
+    prev_weth = None
+    prev_usdt = None
+    current_usd = snapshot.get("uni_fees_unclaimed") or 0
+    current_weth = snapshot.get("uni_weth_fees") or 0
+    current_usdt = snapshot.get("uni_usdt_fees") or 0
+
+    for row in farm_rows:
+        usd = row.get("uni_fees_unclaimed")
+        weth = row.get("uni_weth_fees")
+        usdt = row.get("uni_usdt_fees")
+        if prev_usd is not None and usd is not None and usd < prev_usd:
+            realized_usd += prev_usd - usd
+        if prev_weth is not None and weth is not None and weth < prev_weth:
+            realized_weth += prev_weth - weth
+        if prev_usdt is not None and usdt is not None and usdt < prev_usdt:
+            realized_usdt += prev_usdt - usdt
+        if usd is not None:
+            prev_usd = usd
+            current_usd = usd
+        if weth is not None:
+            prev_weth = weth
+            current_weth = weth
+        if usdt is not None:
+            prev_usdt = usdt
+            current_usdt = usdt
+
+    return {
+        "usd": realized_usd + current_usd,
+        "weth": realized_weth + current_weth,
+        "wbtc": 0.0,
+        "usdt": realized_usdt + current_usdt,
+        "usdc": 0.0,
+        "unclaimed_usd": current_usd,
+        "unclaimed_weth": current_weth,
+        "unclaimed_usdt": current_usdt,
+    }
+
+
+def calc_active_farm_last_24h(history: list[dict[str, Any]], snapshot: dict[str, Any]) -> dict[str, float | None]:
+    active_ids = snapshot.get("uni_active_position_ids")
+    timestamp = snapshot.get("timestamp")
+    if not timestamp:
+        return {"fees_usd": None, "weth": None, "usdt": None, "financing": snapshot.get("daily_financing_carry"), "total": None}
+
+    cutoff = datetime.fromisoformat(timestamp) - timedelta(hours=24)
+    farm_rows = [row for row in history if same_active_farm(row, active_ids)]
+    fee_rows = [
+        row for row in farm_rows
+        if row.get("timestamp") and datetime.fromisoformat(row["timestamp"]) >= cutoff
+    ]
+
+    fees_usd = sum(row.get("uni_daily_fee_yield") or 0 for row in fee_rows)
+    weth = 0.0
+    usdt = 0.0
+    prev_weth = None
+    prev_usdt = None
+    for row in farm_rows:
+        row_timestamp = row.get("timestamp")
+        if not row_timestamp:
+            continue
+        in_window = datetime.fromisoformat(row_timestamp) >= cutoff
+        current_weth = row.get("uni_weth_fees")
+        current_usdt = row.get("uni_usdt_fees")
+        if in_window and prev_weth is not None and current_weth is not None:
+            weth += max(0.0, current_weth - prev_weth)
+        if in_window and prev_usdt is not None and current_usdt is not None:
+            usdt += max(0.0, current_usdt - prev_usdt)
+        if current_weth is not None:
+            prev_weth = current_weth
+        if current_usdt is not None:
+            prev_usdt = current_usdt
+
+    financing = snapshot.get("daily_financing_carry")
+    total = fees_usd + financing if financing is not None else fees_usd
+    return {
+        "fees_usd": fees_usd,
+        "weth": weth,
+        "usdt": usdt,
+        "financing": financing,
+        "total": total,
+    }
+
+
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
     chart_rows = []
-    running_fees = 0.0
-    running_aave = 0.0
+    realized_lp_fees = 0.0
+    previous_unclaimed_fees = None
+    running_financing_carry = 0.0
     for row in history:
         fee_value = row.get("uni_daily_fee_yield")
-        carry_value = row.get("aave_daily_carry")
-        running_fees += fee_value or 0
-        running_aave += carry_value or 0
+        carry_value = row.get("daily_financing_carry")
+        if carry_value is None:
+            carry_value = row_financing_carry(row)
+        unclaimed_fees = row.get("uni_fees_unclaimed")
+        persisted_realized_fees = row.get("cumulative_realized_fees_usd")
+        if previous_unclaimed_fees is not None and unclaimed_fees is not None:
+            if unclaimed_fees < previous_unclaimed_fees:
+                realized_lp_fees += previous_unclaimed_fees - unclaimed_fees
+        if unclaimed_fees is not None:
+            previous_unclaimed_fees = unclaimed_fees
+
+        if persisted_realized_fees is not None:
+            realized_lp_fees = persisted_realized_fees
+        cumulative_lp_output = realized_lp_fees + (unclaimed_fees or 0)
+        running_financing_carry += carry_value or 0
+        cumulative_total_output = cumulative_lp_output + running_financing_carry
         total_eth_exposure = (
             (row.get("aweth_balance") or 0)
             + (row.get("eth_main") or 0)
@@ -1051,9 +1385,9 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
                 "ltv_pct": row.get("ltv_pct"),
                 "uni_daily_fee_yield": fee_value,
                 "aave_daily_carry": carry_value,
-                "cumulative_lp_fees": running_fees,
-                "cumulative_aave_carry": running_aave,
-                "cumulative_net_output": running_fees + running_aave,
+                "cumulative_lp_fees": cumulative_lp_output,
+                "cumulative_aave_carry": running_financing_carry,
+                "cumulative_net_output": cumulative_total_output,
                 "total_eth_exposure": total_eth_exposure,
                 "total_btc_exposure": row.get("awbtc_balance"),
                 "uni_position_value": row.get("uni_position_value"),
@@ -1081,7 +1415,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     )
     risk_label, risk_class = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
     risk_display = risk_label.title()
-    carry_class = "green" if (snapshot.get("aave_daily_carry") or 0) >= 0 else "red"
+    carry_class = "green" if (snapshot.get("daily_financing_carry") or 0) >= 0 else "red"
     gas_row = ""
     if snapshot.get("gas_usd") is not None and snapshot.get("gas_usd") > 0:
         gas_row = f"""
@@ -1126,16 +1460,65 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
         else None
     )
     cumulative_lp_fees = chart_rows[-1]["cumulative_lp_fees"] if chart_rows else None
-    cumulative_aave_carry = chart_rows[-1]["cumulative_aave_carry"] if chart_rows else None
+    cumulative_financing_carry = chart_rows[-1]["cumulative_aave_carry"] if chart_rows else None
     cumulative_net_output = chart_rows[-1]["cumulative_net_output"] if chart_rows else None
+    farm_history = load_farm_history()
+    active_nft_ids = parse_nft_ids(snapshot.get("uni_active_position_ids"))
+    history_lifetime = sum_farm_history(farm_history, snapshot.get("eth_price"), snapshot.get("btc_price"))
+    history_active = sum_farm_history(
+        farm_history,
+        snapshot.get("eth_price"),
+        snapshot.get("btc_price"),
+        active_nft_ids,
+    )
+    lifetime_weth_earned = history_lifetime["weth"] + (snapshot.get("uni_weth_fees") or 0)
+    lifetime_wbtc_earned = history_lifetime["wbtc"]
+    lifetime_usdt_earned = history_lifetime["usdt"] + (snapshot.get("uni_usdt_fees") or 0)
+    lifetime_usdc_earned = history_lifetime["usdc"]
+    if farm_history:
+        cumulative_lp_fees = history_lifetime["usd"] + (snapshot.get("uni_fees_unclaimed") or 0)
+        cumulative_net_output = (
+            cumulative_lp_fees + cumulative_financing_carry
+            if cumulative_financing_carry is not None
+            else cumulative_lp_fees
+        )
+    active_farm_lifetime = calc_active_farm_output(history, snapshot)
+    if farm_history:
+        active_farm_lifetime = {
+            "usd": history_active["usd"] + (snapshot.get("uni_fees_unclaimed") or 0),
+            "weth": history_active["weth"] + (snapshot.get("uni_weth_fees") or 0),
+            "wbtc": history_active["wbtc"],
+            "usdt": history_active["usdt"] + (snapshot.get("uni_usdt_fees") or 0),
+            "usdc": history_active["usdc"],
+            "realized_usd": history_active["usd"],
+            "unclaimed_usd": snapshot.get("uni_fees_unclaimed") or 0,
+            "csv_rows": history_active["rows"],
+        }
+    active_farm_24h = calc_active_farm_last_24h(history, snapshot)
+    active_farm_tracked_asset_usd = (
+        (active_farm_lifetime.get("weth") or 0) * snapshot["eth_price"]
+        + (active_farm_lifetime.get("wbtc") or 0) * (snapshot.get("btc_price") or 0)
+        + (active_farm_lifetime.get("usdt") or 0)
+        + (active_farm_lifetime.get("usdc") or 0)
+        if snapshot.get("eth_price") is not None
+        else None
+    )
+    active_farm_unattributed_usd = (
+        max(0.0, (active_farm_lifetime.get("usd") or 0) - active_farm_tracked_asset_usd)
+        if active_farm_tracked_asset_usd is not None
+        else None
+    )
+    financing_carry_today = active_farm_24h.get("financing")
+    last_24h_total = active_farm_24h.get("total")
     unit_chart_html = ""
     if show_unit_chart:
         unit_chart_html = """
       <div class="card"><h2>Unit Accumulation Over Time</h2><div class="chart-wrap"><canvas id="unitAccumulationChart"></canvas></div><div class="subvalue">Includes LP exposure; LP assets may be used to repay debt.</div></div>"""
-    farm_apy_note = (
-        '<div class="subvalue">(7d avg — no new fees today)</div>'
-        if snapshot.get("current_farm_apy_is_fallback")
-        else ""
+    farm_apy_note = " (7d avg)" if snapshot.get("current_farm_apy_is_fallback") else ""
+    current_farm_apy_value = (
+        f'{percent(snapshot.get("current_farm_apy"), 1)}{farm_apy_note}'
+        if snapshot.get("current_farm_apy") is not None
+        else "Not enough data"
     )
 
     html = f"""<!doctype html>
@@ -1247,26 +1630,34 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .mini-list strong {{ color: var(--text); font-weight: 700; }}
     .uni-card {{ margin-top: 20px; }}
     .uni-grid {{ display: grid; grid-template-columns: 160px 1fr; gap: 9px 14px; }}
-    .active-farm {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
+    .active-farm {{ display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 20px; }}
     .farm-panel {{ min-width: 0; }}
     .farm-panel h3 {{ margin: 0 0 12px; font-size: 15px; }}
+    .farm-split {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
+    .farm-output-value {{ margin: 6px 0 12px; font-size: 34px; font-weight: 780; }}
+    .strategy-output-value {{ margin-top: 4px; font-size: 24px; font-weight: 760; }}
+    .farm-output-lines {{ display: grid; gap: 8px; margin-bottom: 16px; }}
+    .farm-output-lines div {{ display: flex; justify-content: space-between; gap: 12px; }}
+    .today-output {{ border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px; }}
+    .range-visual {{ margin: 48px auto 8px; padding: 0 8px; width: 100%; max-width: 720px; }}
     .status-dot {{ display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 7px; background: var(--muted); }}
     .status-dot.green {{ background: var(--green); }}
     .status-dot.red {{ background: var(--red); }}
     .range-labels {{ display: flex; justify-content: space-between; margin-top: 14px; color: var(--muted); font-size: 13px; }}
     .range-bar {{
       position: relative;
-      height: 14px;
-      margin: 8px 0 20px;
+      height: 34px;
+      margin: 28px 0 40px;
       border-radius: 999px;
       background: linear-gradient(90deg, var(--red) 0 10%, var(--green) 10% 90%, var(--red) 90% 100%);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
     }}
     .range-dot {{
       position: absolute;
       left: var(--range-position);
       top: 50%;
-      width: 18px;
-      height: 18px;
+      width: 40px;
+      height: 40px;
       border: 3px solid #ffffff;
       border-radius: 999px;
       background: var(--card);
@@ -1274,7 +1665,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       box-shadow: 0 0 0 2px rgba(15, 17, 21, 0.85);
     }}
     .range-now {{ text-align: center; color: var(--text); font-weight: 700; }}
-    .range-caption {{ margin-top: 18px; color: var(--muted); }}
+    .range-caption {{ margin-top: 22px; color: var(--muted); font-weight: 700; }}
     .gas-row {{
       margin: -8px 0 20px;
       color: var(--muted);
@@ -1288,15 +1679,8 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .subvalue {{ margin-top: 7px; color: var(--muted); font-size: 12px; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
     .grid.five {{ grid-template-columns: repeat(5, minmax(0, 1fr)); }}
+    .grid.six {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
     .grid.three {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-    .context-row {{
-      margin: -4px 0 20px;
-      color: var(--muted);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px 14px;
-      background: rgba(129, 140, 248, 0.06);
-    }}
     .placeholder {{
       white-space: pre-line;
       color: var(--muted);
@@ -1318,7 +1702,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     footer {{ margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }}
     @media (max-width: 820px) {{
       main {{ width: min(100% - 20px, 1180px); padding: 20px 0; }}
-      .grid, .grid.five, .grid.three, .health-grid, .active-farm, .banner, .two-col {{ grid-template-columns: 1fr; }}
+      .grid, .grid.five, .grid.six, .grid.three, .health-grid, .active-farm, .farm-split, .banner, .two-col {{ grid-template-columns: 1fr; }}
       header {{ display: block; }}
       .refresh-btn {{ margin-top: 12px; }}
       h1 {{ font-size: 26px; }}
@@ -1348,54 +1732,70 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi compact-risk {risk_class}"><div class="label">Liquidation Risk</div><div class="value {risk_class}">{percent(snapshot.get("correlated_liq_drop_pct"))}</div><div class="mini-list"><span>ETH liq <strong>{whole_money(snapshot.get("correlated_liq_price_eth"))}</strong></span><span>BTC liq <strong>{whole_money(snapshot.get("correlated_liq_price_btc"))}</strong></span><span>Status <strong class="{risk_class}">{escape(risk_display)}</strong></span></div></div>
     </section>
 
-    <h2 class="section-title">ACTIVE FARM</h2>
-    <section class="active-farm">
-      <div class="card farm-panel">
-        <h3>Farm Status</h3>
-        <div class="uni-grid">
-          <div class="label">Pair</div><div>WETH / USDT 0.3%</div>
-          <div class="label">Status</div><div class="{uni_status_class}"><span class="status-dot {uni_dot_class}"></span>{escape(uni_status_text)}</div>
-          <div class="label">Current price</div><div>{whole_money(snapshot.get("eth_price"))}</div>
-          <div class="label">Range</div><div>{whole_money(snapshot.get("uni_price_lower"))} - {whole_money(snapshot.get("uni_price_upper"))}</div>
-          <div class="label">Position value</div><div>{money(snapshot.get("uni_position_value"))}</div>
-          <div class="label">Active ID</div><div>{escape(active_ids)}</div>
-        </div>
-      </div>
-      <div class="card farm-panel">
-        <h3>APY / Output</h3>
-        <div class="uni-grid">
-          <div class="label">Current Farm APY</div><div class="green">{percent(snapshot.get("current_farm_apy"), 1)}{farm_apy_note}</div>
-          <div class="label">7d APY</div><div>{apy_value(snapshot.get("apy_7d"))}</div>
-          <div class="label">30d APY</div><div>{apy_value(snapshot.get("apy_30d"))}</div>
-          <div class="label">Daily LP fees</div><div>{money(snapshot.get("uni_daily_fee_yield"))}</div>
-          <div class="label">Cumulative LP fees</div><div>{money(cumulative_lp_fees)}</div>
-          <div class="label">Cumulative AAVE carry</div><div>{money(cumulative_aave_carry)}</div>
-          <div class="label">Total cumulative net</div><div>{money(cumulative_net_output)}</div>
-          <div class="label">Unclaimed fees</div><div>{money(snapshot.get("uni_fees_unclaimed"))}</div>
-        </div>
-      </div>
-      <div class="card farm-panel">
-        <h3>Composition</h3>
-        <div class="uni-grid">
-          <div class="label">ETH amount</div><div>{number(snapshot.get("uni_weth_amount"), 4)} ETH <span class="muted">({money(uni_weth_value)})</span></div>
-          <div class="label">USDT amount</div><div>{number(snapshot.get("uni_usdt_amount"), 2)} USDT</div>
-          <div class="label">LP stable %</div><div>{percent(lp_stable_pct, 1)}</div>
-          <div class="label">APY quality</div><div>{escape(snapshot.get("apy_quality", "N/A"))}</div>
-        </div>
-        <div class="range-caption">ETH/USDT 0.3% &middot; {escape(uni_status_text)}</div>
-        <div class="range-labels"><span>{whole_money(snapshot.get("uni_price_lower"))}</span><span>{whole_money(snapshot.get("uni_price_upper"))}</span></div>
-        <div class="range-bar" style="--range-position: {range_position:.2f}%"><span class="range-dot"></span></div>
-        <div class="range-now">{whole_money(snapshot.get("eth_price"))}</div>
-      </div>
-    </section>
-    <div class="context-row">APY {percent(snapshot.get("current_farm_apy"), 1)} &nbsp; | &nbsp; HF {number(hf, 3)} &nbsp; | &nbsp; Borrow Usage {percent(snapshot.get("borrow_usage_pct"), 1)} &nbsp; | &nbsp; Stable Buffer {percent(snapshot.get("stable_buffer_pct"), 1)}</div>
-
     <h2 class="section-title">FLYWHEEL STRENGTH</h2>
-    <section class="grid">
+    <section class="grid six">
       <div class="card kpi"><div class="label">Collateral Growth 30d</div><div class="value">{signed_percent(snapshot.get("coll_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Debt Growth 30d</div><div class="value">{signed_percent(snapshot.get("debt_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Net Flywheel Expansion</div><div class="value">{signed_percent(snapshot.get("flywheel_expansion"))}</div></div>
+      <div class="card kpi"><div class="label">Lifetime Strategy Output</div><div class="strategy-output-value green">{money(cumulative_lp_fees)}</div><div class="subvalue">All farms LP fees<br>WETH: {number(lifetime_weth_earned, 6)}<br>WBTC: {number(lifetime_wbtc_earned, 6)}<br>USDT: {number(lifetime_usdt_earned, 2)}<br>USDC: {number(lifetime_usdc_earned, 2)}<br>Estimated USD total: {money(cumulative_lp_fees)}</div></div>
+      <div class="card kpi"><div class="label">Lifetime Financing Carry</div><div class="strategy-output-value {carry_class}">{signed_money(cumulative_financing_carry)}</div><div class="subvalue">Estimated interest on borrowed stables<br>Net after carry: {money(cumulative_net_output)}</div></div>
       <div class="card kpi"><div class="label">Borrow Room</div><div class="value indigo">{money(snapshot.get("remaining_borrow_room"))}</div><div class="subvalue">AAVE max LTV</div></div>
+    </section>
+
+    <h2 class="section-title">ACTIVE FARM</h2>
+    <section class="active-farm">
+      <div class="card farm-panel">
+        <h3>Position &middot; Uniswap NFT {escape(active_ids)}</h3>
+        <div class="subvalue">Uniswap V3 position NFT</div>
+        <div class="farm-split">
+          <div class="uni-grid">
+            <div class="label">Pair</div><div>WETH / USDT 0.3%</div>
+            <div class="label">Current price</div><div>{whole_money(snapshot.get("eth_price"))}</div>
+            <div class="label">Range</div><div>{whole_money(snapshot.get("uni_price_lower"))} - {whole_money(snapshot.get("uni_price_upper"))}</div>
+          </div>
+          <div>
+            <div class="uni-grid">
+              <div class="label">ETH amount</div><div>{number(snapshot.get("uni_weth_amount"), 4)} ETH <span class="muted">({money(uni_weth_value)})</span></div>
+              <div class="label">USDT amount</div><div>{number(snapshot.get("uni_usdt_amount"), 2)} USDT</div>
+              <div class="label">LP stable %</div><div>{percent(lp_stable_pct, 1)}</div>
+              <div class="label">Position value</div><div>{money(snapshot.get("uni_position_value"))}</div>
+            </div>
+          </div>
+        </div>
+        <div class="range-visual">
+          <div class="range-caption">ETH/USDT 0.3% &middot; <span class="{uni_status_class}">{escape(uni_status_text)}</span></div>
+          <div class="range-labels"><span>{whole_money(snapshot.get("uni_price_lower"))}</span><span>{whole_money(snapshot.get("uni_price_upper"))}</span></div>
+          <div class="range-bar" style="--range-position: {range_position:.2f}%"><span class="range-dot"></span></div>
+          <div class="range-now">{whole_money(snapshot.get("eth_price"))}</div>
+        </div>
+      </div>
+      <div class="card farm-panel">
+        <h3>Active Farm Output</h3>
+        <div class="farm-output-value green">{money(active_farm_lifetime.get("usd"))}</div>
+        <div class="subvalue">Active NFT lifetime estimate<br>WETH: {number(active_farm_lifetime.get("weth"), 6)}<br>WBTC: {number(active_farm_lifetime.get("wbtc"), 6)}<br>USDT: {number(active_farm_lifetime.get("usdt"), 2)}<br>USDC: {number(active_farm_lifetime.get("usdc"), 2)}<br>Current unclaimed: {money(active_farm_lifetime.get("unclaimed_usd"))}<br>Unattributed realized USD: {money(active_farm_unattributed_usd)}<br>Estimated USD total: {money(active_farm_lifetime.get("usd"))}</div>
+        <div class="today-output">
+          <div class="label">Last 24h</div>
+          <div class="farm-output-lines">
+            <div><span class="label">Total</span><strong>{signed_money(last_24h_total)}</strong></div>
+            <div><span class="label">LP fees</span><strong>{signed_money(active_farm_24h.get("fees_usd"))}</strong></div>
+            <div><span class="label">WETH fees</span><strong>{signed_asset(active_farm_24h.get("weth"), "WETH")}</strong></div>
+            <div><span class="label">USDT fees</span><strong>{signed_asset(active_farm_24h.get("usdt"), "USDT", 2)}</strong></div>
+            <div><span class="label">Estimated financing carry</span><strong>{signed_money(financing_carry_today)}</strong></div>
+          </div>
+        </div>
+        <div class="uni-grid" style="margin-top: 14px;">
+          <div class="label">Current Farm APY</div><div class="green">{current_farm_apy_value}</div>
+          <div class="label">7d APY</div><div>{apy_value(snapshot.get("apy_7d"))}</div>
+          <div class="label">30d APY</div><div>{apy_value(snapshot.get("apy_30d"))}</div>
+          <div class="label">APY quality</div><div>{escape(snapshot.get("apy_quality", "N/A"))}</div>
+        </div>
+        <h3 style="margin-top: 18px;">Current Unclaimed Fees</h3>
+        <div class="uni-grid">
+          <div class="label">Unclaimed WETH</div><div>{number(snapshot.get("uni_weth_fees"), 6)} WETH</div>
+          <div class="label">Unclaimed USDT</div><div>{number(snapshot.get("uni_usdt_fees"), 2)} USDT</div>
+          <div class="label">Estimated USD</div><div>&asymp; {money(snapshot.get("uni_fees_unclaimed"))}</div>
+        </div>
+      </div>
     </section>
 
     <h2 class="section-title">UNIT ACCUMULATION</h2>
@@ -1582,7 +1982,7 @@ config.py to enable this.</div>
         labels,
         datasets: [
           {{ type: "line", label: "Cumulative LP Fees", data: cumulativeFeeYields, borderColor: "#fbbf24", backgroundColor: "rgba(251, 191, 36, 0.15)", tension: 0.25, yAxisID: "y" }},
-          {{ type: "line", label: "Cumulative AAVE Carry", data: cumulativeAaveCarries, borderColor: "#818cf8", backgroundColor: "rgba(129, 140, 248, 0.12)", tension: 0.25, yAxisID: "y" }},
+          {{ type: "line", label: "Borrow Carry", data: cumulativeAaveCarries, borderColor: "#818cf8", backgroundColor: "rgba(129, 140, 248, 0.12)", tension: 0.25, yAxisID: "y" }},
           {{ type: "line", label: "Total Cumulative Net Output", data: cumulativeNetOutputs, borderColor: "#34d399", backgroundColor: "rgba(52, 211, 153, 0.12)", tension: 0.25, yAxisID: "y" }}
         ]
       }},
@@ -1710,9 +2110,17 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
         return False
 
     init_db()
-    previous_rows = get_history(1)
-    previous_fees_usd = previous_rows[-1].get("uni_fees_unclaimed") if previous_rows else None
-    snapshot = compute_snapshot(raw, timestamp, previous_fees_usd, gas_eth)
+    previous_history = get_history(1000)
+    previous_snapshot = previous_history[-1] if previous_history else None
+    fee_seed = calc_fee_accounting_seed(previous_history)
+    if previous_snapshot:
+        previous_snapshot = dict(previous_snapshot)
+        for key, value in fee_seed.items():
+            previous_value = previous_snapshot.get(key)
+            if previous_value is None or value > previous_value:
+                previous_snapshot[key] = value
+    previous_fees_usd = previous_snapshot.get("uni_fees_unclaimed") if previous_snapshot else None
+    snapshot = compute_snapshot(raw, timestamp, previous_fees_usd, previous_snapshot, gas_eth)
     risk_label, _ = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
     print(f"ETH price:        {money(snapshot.get('eth_price'))}")
     print(f"BTC price:        {money(snapshot.get('btc_price'))}")
@@ -1749,7 +2157,7 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print(f"  Total:      {money(snapshot.get('uni_fees_unclaimed'))}")
 
     insert_snapshot(snapshot)
-    history = get_history(30)
+    history = get_history(1000)
     generate_dashboard(snapshot, history)
 
     print("Dashboard generated: dashboard.html")
