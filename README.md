@@ -236,7 +236,9 @@ DeFi-Path-Dashboard/
 ├── config.py           # your config (not in git)
 ├── config.example.py   # template
 ├── data/
-│   └── portfolio.db    # local SQLite database (not in git)
+│   ├── portfolio.db              # local SQLite database (not in git)
+│   ├── farm_history.csv          # your manual farm history (not in git)
+│   └── farm_history.example.csv  # template for manual farm history
 └── README.md
 ```
 
