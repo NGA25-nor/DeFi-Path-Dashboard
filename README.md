@@ -46,6 +46,8 @@ python3 tracker.py
 
 Dashboard opens at `http://localhost:5050`. That's it. 🎉
 
+On first run, `tracker.py` automatically creates the local SQLite database at `data/portfolio.db`.
+
 ---
 
 ## Daily use
@@ -90,6 +92,8 @@ Use realized/collected fees only. Current unclaimed fees are fetched live and ad
 
 If `data/farm_history.csv` is missing, the dashboard still runs and uses live/snapshot data only.
 
+The CSV is for realized/collected fees only. Do not enter current unclaimed fees here; those are fetched live.
+
 ---
 
 ## What the dashboard shows
@@ -122,16 +126,20 @@ Appear only when triggered — calm and direct:
 - AAVE borrow cost exceeds LP fees
 
 ### Active Farm
-Combined Uniswap V3 position + APY view:
+Live Uniswap V3 position + output view:
 - Pair, status, current price, range, position value
 - Current / 7d / 30d farm APY
-- Daily LP fees, cumulative fees, unclaimed fees
-- ETH/USDT composition, range bar
+- Active farm lifetime output estimate by WETH/WBTC/USDT/USDC
+- Last 24h LP fees, token fees, and estimated financing carry
+- Current unclaimed fees
+- ETH/USDT composition and range bar
 
 ### Flywheel Strength
 - Collateral growth 30d
 - Debt growth 30d
 - Net flywheel expansion (collateral growth − debt growth)
+- Lifetime Strategy Output across all farms
+- Lifetime Financing Carry as estimated interest on borrowed stables
 - Borrow Room (remaining capacity from AAVE)
 
 ### Unit Accumulation
@@ -190,7 +198,8 @@ All calls are **read-only**. No private keys. No transactions.
 **AAVE:**
 - Collateral, debt, equity, HF, LTV
 - Supply APY (WETH) and borrow APY (USDT)
-- Daily carry = supply income − borrow cost
+- Financing carry = estimated borrow cost on stable debt, shown as a negative farm cost
+- AAVE carry = supply income − borrow cost, kept for reference
 - Borrow Room = AAVE `availableBorrowsBase` from `getUserAccountData`
 
 **Liquidation:**
@@ -205,6 +214,7 @@ All calls are **read-only**. No private keys. No transactions.
 - In/out of range status
 - Unclaimed fees via The Graph subgraph
 - Daily fee yield = difference from previous snapshot
+- Optional manual realized fee history from `data/farm_history.csv`
 
 **Portfolio:**
 - Total equity = AAVE equity + ETH balances + LP value
