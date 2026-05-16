@@ -94,6 +94,13 @@ If `data/farm_history.csv` is missing, the dashboard still runs and uses live/sn
 
 The CSV is for realized/collected fees only. Do not enter current unclaimed fees here; those are fetched live.
 
+When a farm appears closed and is not already in your manual history, the tracker may create:
+```text
+data/farm_history_suggestions.csv
+```
+
+Review suggested rows before copying them into `data/farm_history.csv`. Suggestions are best-effort and are not treated as final accounting.
+
 ---
 
 ## What the dashboard shows
@@ -125,8 +132,8 @@ Appear only when triggered — calm and direct:
 - Gas drag above 20%
 - AAVE borrow cost exceeds LP fees
 
-### Active Farm
-Live Uniswap V3 position + output view:
+### Active Farms
+Live Uniswap V3 position + output view. If multiple farms are active, each NFT is shown separately:
 - Pair, status, current price, range, position value
 - Current / 7d / 30d farm APY
 - Active farm lifetime output estimate by WETH/WBTC/USDT/USDC
@@ -248,6 +255,7 @@ DeFi-Path-Dashboard/
 ├── data/
 │   ├── portfolio.db              # local SQLite database (not in git)
 │   ├── farm_history.csv          # your manual farm history (not in git)
+│   ├── farm_history_suggestions.csv # closed farm suggestions (not in git)
 │   └── farm_history.example.csv  # template for manual farm history
 └── README.md
 ```
