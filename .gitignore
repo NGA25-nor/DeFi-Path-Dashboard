@@ -1,6 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local user config
 config.py
-data/*
-!data/farm_history.example.csv
+
+# Local databases
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Personal farm ledger
+data/farm_history.csv
+data/farm_history_suggestions.csv
+
+# Generated dashboard
 dashboard.html
+
 .DS_Store
 venv/
