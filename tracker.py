@@ -38,9 +38,12 @@ AWETH = "0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8"
 AWBTC = "0x5Ee5bf7ae06D1Be5997A1A72006FE6C607eC6DE8"
 VDUSDT = "0x531842cebfcce26401911cb6d3b170f8b2fc57c6"
 UNI_V3_NFT_MANAGER = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
+UNI_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 UNI_WETH_USDT_POOL = "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"
 WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+WBTC = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
 USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 ETH_USD_FEED = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
 BTC_USD_FEED = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
 ETH_LIQ_THRESHOLD = 0.825
@@ -55,6 +58,7 @@ GET_RESERVE_DATA_SELECTOR = "0x35ea6a75"
 TOKEN_OF_OWNER_BY_INDEX_SELECTOR = "0x2f745c59"
 POSITIONS_SELECTOR = "0x99fbab88"
 SLOT0_SELECTOR = "0x3850c7bd"
+GET_POOL_SELECTOR = "0x1698ee82"
 Q96 = 2**96
 Q128 = 2**128
 Q256 = 2**256
@@ -65,7 +69,15 @@ BASE_DIR = Path(__file__).resolve().parent
 DASHBOARD_PATH = BASE_DIR / "dashboard.html"
 DB_FILE = BASE_DIR / "data" / "portfolio.db"
 FARM_HISTORY_FILE = BASE_DIR / "data" / "farm_history.csv"
+FARM_HISTORY_SUGGESTIONS_FILE = BASE_DIR / "data" / "farm_history_suggestions.csv"
 REQUEST_TIMEOUT = 20
+
+TOKEN_META = {
+    WETH.lower(): {"symbol": "WETH", "decimals": 18, "price_key": "eth_price"},
+    WBTC.lower(): {"symbol": "WBTC", "decimals": 8, "price_key": "btc_price"},
+    USDT.lower(): {"symbol": "USDT", "decimals": 6, "price_key": "stable"},
+    USDC.lower(): {"symbol": "USDC", "decimals": 6, "price_key": "stable"},
+}
 
 
 class RpcError(Exception):
@@ -103,6 +115,10 @@ def hex_to_int(value: str) -> int:
 
 def pad_uint(value: int) -> str:
     return hex(value)[2:].rjust(64, "0")
+
+
+def pad_uint24(value: int) -> str:
+    return pad_uint(value)
 
 
 def decode_address_word(word: int) -> str:
@@ -224,12 +240,30 @@ def fetch_uni_position(token_id: int) -> dict[str, Any]:
     }
 
 
-def fetch_weth_usdt_slot0() -> dict[str, int]:
-    result = eth_call(UNI_WETH_USDT_POOL, SLOT0_SELECTOR)
+def fetch_uni_pool_address(token0: str, token1: str, fee: int) -> str | None:
+    result = eth_call(
+        UNI_V3_FACTORY,
+        GET_POOL_SELECTOR + pad_address(token0) + pad_address(token1) + pad_uint24(fee),
+    )
+    words = decode_uint_words(result)
+    if not words:
+        return None
+    pool = decode_address_word(words[0])
+    if int(pool, 16) == 0:
+        return None
+    return pool
+
+
+def fetch_slot0(pool_address: str) -> dict[str, int]:
+    result = eth_call(pool_address, SLOT0_SELECTOR)
     words = decode_uint_words(result)
     if len(words) < 2:
         raise RpcError("slot0() returned too few fields")
     return {"sqrt_price_x96": words[0], "tick": decode_signed_word(words[1])}
+
+
+def fetch_weth_usdt_slot0() -> dict[str, int]:
+    return fetch_slot0(UNI_WETH_USDT_POOL)
 
 
 def tick_to_sqrt_price(tick: int) -> float:
@@ -239,6 +273,34 @@ def tick_to_sqrt_price(tick: int) -> float:
 def tick_to_price(tick: int, token0_decimals: int = 18, token1_decimals: int = 6) -> float:
     raw_price = 1.0001**tick
     return raw_price * (10**token0_decimals) / (10**token1_decimals)
+
+
+def token_symbol(address: str) -> str:
+    return TOKEN_META.get(address.lower(), {}).get("symbol", "UNKNOWN")
+
+
+def token_decimals(address: str) -> int:
+    return TOKEN_META.get(address.lower(), {}).get("decimals", 18)
+
+
+def token_usd_price(address: str, eth_price: float | None, btc_price: float | None) -> float | None:
+    price_key = TOKEN_META.get(address.lower(), {}).get("price_key")
+    if price_key == "eth_price":
+        return eth_price
+    if price_key == "btc_price":
+        return btc_price
+    if price_key == "stable":
+        return 1.0
+    return None
+
+
+def pair_label(token0: str, token1: str, fee: int) -> str:
+    fee_pct = fee / 1_000_000 * 100
+    return f"{token_symbol(token0)} / {token_symbol(token1)} {fee_pct:g}%"
+
+
+def token_amounts_by_symbol(token_amounts: dict[str, float], symbol: str) -> float:
+    return token_amounts.get(symbol, 0.0)
 
 
 def get_uni_amounts(
@@ -321,11 +383,15 @@ def fetch_unclaimed_fees_subgraph(token_ids: list[int]) -> list[dict[str, Any]]:
         return []
 
 
-def compute_fees_from_subgraph(position: dict[str, Any], eth_price: float | None) -> tuple[float, float, float]:
+def compute_fees_from_subgraph(
+    position: dict[str, Any],
+    eth_price: float | None,
+    btc_price: float | None = None,
+) -> tuple[float, float, float, dict[str, float]]:
     try:
         liquidity = int(position["liquidity"])
         if liquidity == 0:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, {}
 
         fg0 = int(position["pool"]["feeGrowthGlobal0X128"])
         fg1 = int(position["pool"]["feeGrowthGlobal1X128"])
@@ -367,26 +433,87 @@ def compute_fees_from_subgraph(position: dict[str, Any], eth_price: float | None
 
         token0_symbol = position["token0"]["symbol"]
         token1_symbol = position["token1"]["symbol"]
+        token_amounts = {token0_symbol: amount0, token1_symbol: amount1}
         usd = 0.0
-        if token0_symbol in ("WETH", "ETH") and eth_price is not None:
-            usd += amount0 * eth_price
-        else:
-            usd += amount0
+        for symbol, amount in token_amounts.items():
+            if symbol in ("WETH", "ETH") and eth_price is not None:
+                usd += amount * eth_price
+            elif symbol == "WBTC" and btc_price is not None:
+                usd += amount * btc_price
+            elif symbol in ("USDT", "USDC", "DAI"):
+                usd += amount
 
-        if token1_symbol in ("USDT", "USDC", "DAI"):
-            usd += amount1
-        elif token1_symbol in ("WETH", "ETH") and eth_price is not None:
-            usd += amount1 * eth_price
-        else:
-            usd += amount1
-
-        return amount0, amount1, max(0.0, usd)
+        return amount0, amount1, max(0.0, usd), token_amounts
     except Exception as exc:
         print(f"  Warning: Fee calculation failed for position: {exc}")
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, {}
 
 
-def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str, Any]:
+def build_uni_farm(
+    position: dict[str, Any],
+    slot0: dict[str, int],
+    eth_price: float | None,
+    btc_price: float | None,
+) -> dict[str, Any]:
+    token0 = position["token0"]
+    token1 = position["token1"]
+    token0_symbol = token_symbol(token0)
+    token1_symbol = token_symbol(token1)
+    token0_decimals = token_decimals(token0)
+    token1_decimals = token_decimals(token1)
+    tick_lower = position["tick_lower"]
+    tick_upper = position["tick_upper"]
+    current_tick = slot0["tick"]
+    amount0_raw, amount1_raw = get_uni_amounts(
+        position["liquidity"],
+        slot0["sqrt_price_x96"],
+        tick_lower,
+        tick_upper,
+        current_tick,
+    )
+    amount0 = amount0_raw / (10**token0_decimals)
+    amount1 = amount1_raw / (10**token1_decimals)
+    price0 = token_usd_price(token0, eth_price, btc_price)
+    price1 = token_usd_price(token1, eth_price, btc_price)
+    value = (amount0 * price0 if price0 is not None else 0) + (
+        amount1 * price1 if price1 is not None else 0
+    )
+    current_price = tick_to_price(current_tick, token0_decimals, token1_decimals)
+    price_lower = tick_to_price(tick_lower, token0_decimals, token1_decimals)
+    price_upper = tick_to_price(tick_upper, token0_decimals, token1_decimals)
+    token_amounts = {token0_symbol: amount0, token1_symbol: amount1}
+    stable_amount = sum(token_amounts.get(symbol, 0.0) for symbol in ("USDT", "USDC"))
+    return {
+        "nft_id": str(position["token_id"]),
+        "pair": pair_label(token0, token1, position["fee"]),
+        "token0_symbol": token0_symbol,
+        "token1_symbol": token1_symbol,
+        "fee": position["fee"],
+        "status": "In Range" if tick_lower <= current_tick <= tick_upper else "Out of Range",
+        "in_range": tick_lower <= current_tick <= tick_upper,
+        "tick_lower": tick_lower,
+        "tick_upper": tick_upper,
+        "current_tick": current_tick,
+        "current_price": current_price,
+        "price_lower": price_lower,
+        "price_upper": price_upper,
+        "position_value": value,
+        "token_amounts": token_amounts,
+        "weth_amount": token_amounts.get("WETH", 0.0),
+        "wbtc_amount": token_amounts.get("WBTC", 0.0),
+        "usdt_amount": token_amounts.get("USDT", 0.0),
+        "usdc_amount": token_amounts.get("USDC", 0.0),
+        "stable_amount": stable_amount,
+        "stable_pct": (stable_amount / value * 100) if value > 0 else 0.0,
+        "unclaimed_usd": 0.0,
+        "unclaimed_weth": 0.0,
+        "unclaimed_wbtc": 0.0,
+        "unclaimed_usdt": 0.0,
+        "unclaimed_usdc": 0.0,
+    }
+
+
+def fetch_uni_position_details(wallet: str, eth_price: float | None, btc_price: float | None = None) -> dict[str, Any]:
     count = fetch_uni_position_count(wallet)
     if count <= 0:
         return {
@@ -403,15 +530,18 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
         }
 
     token_ids = fetch_uni_token_ids(wallet, count)
-    slot0 = fetch_weth_usdt_slot0()
     total_value = 0.0
     total_weth = 0.0
+    total_wbtc = 0.0
     total_usdt = 0.0
+    total_usdc = 0.0
     in_range_values = []
     tick_lowers = []
     tick_uppers = []
     active_ids = []
     closed_ids = []
+    active_farms = []
+    closed_farms = []
     valued_any = False
 
     for token_id in token_ids:
@@ -419,61 +549,81 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
         liquidity = position["liquidity"]
         if liquidity == 0:
             closed_ids.append(token_id)
+            owed0 = position["tokens_owed0"] / (10 ** token_decimals(position["token0"]))
+            owed1 = position["tokens_owed1"] / (10 ** token_decimals(position["token1"]))
+            owed = {
+                token_symbol(position["token0"]): owed0,
+                token_symbol(position["token1"]): owed1,
+            }
+            closed_farms.append({
+                "nft_id": str(token_id),
+                "pair": pair_label(position["token0"], position["token1"], position["fee"]),
+                "status": "closed",
+                "token0_symbol": token_symbol(position["token0"]),
+                "token1_symbol": token_symbol(position["token1"]),
+                "tokens_owed0": owed0,
+                "tokens_owed1": owed1,
+                "owed_weth": owed.get("WETH", 0.0),
+                "owed_wbtc": owed.get("WBTC", 0.0),
+                "owed_usdt": owed.get("USDT", 0.0),
+                "owed_usdc": owed.get("USDC", 0.0),
+            })
             continue
 
         token0 = position["token0"].lower()
         token1 = position["token1"].lower()
-        if token0 != WETH.lower() or token1 != USDT.lower() or position["fee"] != 3000:
-            print(f"Warning: unknown Uniswap pool for token ID #{token_id}; skipping value calculation")
+        if token0 not in TOKEN_META or token1 not in TOKEN_META:
+            print(f"Warning: unknown Uniswap pool tokens for token ID #{token_id}; skipping value calculation")
             closed_ids.append(token_id)
             continue
+        pool_address = fetch_uni_pool_address(position["token0"], position["token1"], position["fee"])
+        if not pool_address:
+            print(f"Warning: could not find Uniswap pool for token ID #{token_id}; skipping value calculation")
+            closed_ids.append(token_id)
+            continue
+        slot0 = fetch_slot0(pool_address)
 
-        tick_lower = position["tick_lower"]
-        tick_upper = position["tick_upper"]
-        current_tick = slot0["tick"]
-        in_range = tick_lower <= current_tick <= tick_upper
-        amount0, amount1 = get_uni_amounts(
-            liquidity,
-            slot0["sqrt_price_x96"],
-            tick_lower,
-            tick_upper,
-            current_tick,
-        )
-        weth_amount = amount0 / 1e18
-        usdt_amount = amount1 / 1e6
-
-        total_weth += weth_amount
-        total_usdt += usdt_amount
-        if eth_price is not None:
-            total_value += weth_amount * eth_price + usdt_amount
+        farm = build_uni_farm(position, slot0, eth_price, btc_price)
+        active_farms.append(farm)
+        total_weth += farm["weth_amount"]
+        total_wbtc += farm["wbtc_amount"]
+        total_usdt += farm["usdt_amount"]
+        total_usdc += farm["usdc_amount"]
+        if farm["position_value"] > 0:
+            total_value += farm["position_value"]
             valued_any = True
         active_ids.append(token_id)
-        in_range_values.append(1 if in_range else 0)
-        tick_lowers.append(tick_lower)
-        tick_uppers.append(tick_upper)
+        in_range_values.append(1 if farm["in_range"] else 0)
+        tick_lowers.append(farm["tick_lower"])
+        tick_uppers.append(farm["tick_upper"])
 
     total_fees = 0.0
     total_weth_fees = 0.0
+    total_wbtc_fees = 0.0
     total_usdt_fees = 0.0
+    total_usdc_fees = 0.0
     subgraph_positions = fetch_unclaimed_fees_subgraph(active_ids)
     if active_ids and not subgraph_positions:
         print("  Warning: Subgraph unavailable — fees shown as $0.00")
 
     for subgraph_position in subgraph_positions:
-        amount0, amount1, fee_usd = compute_fees_from_subgraph(subgraph_position, eth_price)
+        amount0, amount1, fee_usd, token_amounts = compute_fees_from_subgraph(subgraph_position, eth_price, btc_price)
         total_fees += fee_usd
         token0_symbol = subgraph_position["token0"]["symbol"]
         token1_symbol = subgraph_position["token1"]["symbol"]
         print(f"  Subgraph token order for #{subgraph_position['id']}: token0={token0_symbol}, token1={token1_symbol}")
-        if token0_symbol in ("WETH", "ETH"):
-            total_weth_fees += amount0
-        elif token0_symbol in ("USDT", "USDC", "DAI"):
-            total_usdt_fees += amount0
-
-        if token1_symbol in ("WETH", "ETH"):
-            total_weth_fees += amount1
-        elif token1_symbol in ("USDT", "USDC", "DAI"):
-            total_usdt_fees += amount1
+        total_weth_fees += token_amounts.get("WETH", 0.0) + token_amounts.get("ETH", 0.0)
+        total_wbtc_fees += token_amounts.get("WBTC", 0.0)
+        total_usdt_fees += token_amounts.get("USDT", 0.0)
+        total_usdc_fees += token_amounts.get("USDC", 0.0)
+        for farm in active_farms:
+            if farm["nft_id"] == str(subgraph_position["id"]):
+                farm["unclaimed_usd"] = fee_usd
+                farm["unclaimed_weth"] = token_amounts.get("WETH", 0.0) + token_amounts.get("ETH", 0.0)
+                farm["unclaimed_wbtc"] = token_amounts.get("WBTC", 0.0)
+                farm["unclaimed_usdt"] = token_amounts.get("USDT", 0.0)
+                farm["unclaimed_usdc"] = token_amounts.get("USDC", 0.0)
+                break
 
     return {
         "uni_positions": count,
@@ -483,9 +633,15 @@ def fetch_uni_position_details(wallet: str, eth_price: float | None) -> dict[str
         "uni_position_value": total_value if valued_any else None,
         "uni_fees_unclaimed": total_fees if valued_any else None,
         "uni_weth_fees": total_weth_fees if valued_any else None,
+        "uni_wbtc_fees": total_wbtc_fees if valued_any else None,
         "uni_usdt_fees": total_usdt_fees if valued_any else None,
+        "uni_usdc_fees": total_usdc_fees if valued_any else None,
         "uni_weth_amount": total_weth if tick_lowers else None,
+        "uni_wbtc_amount": total_wbtc if tick_lowers else None,
         "uni_usdt_amount": total_usdt if tick_lowers else None,
+        "uni_usdc_amount": total_usdc if tick_lowers else None,
+        "uni_active_farms": active_farms,
+        "uni_closed_farms": closed_farms,
         "uni_in_range": 1 if in_range_values and all(in_range_values) else 0 if in_range_values else None,
         "uni_tick_lower": tick_lowers[0] if tick_lowers else None,
         "uni_tick_upper": tick_uppers[0] if tick_uppers else None,
@@ -635,6 +791,66 @@ def sum_farm_history(
     }
 
 
+def known_history_ids(*row_groups: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for rows in row_groups:
+        ids.update(str(row.get("nft_id", "")).strip().lstrip("#") for row in rows if row.get("nft_id"))
+    return ids
+
+
+def append_farm_history_suggestions(
+    closed_farms: list[dict[str, Any]],
+    history_rows: list[dict[str, Any]],
+    suggestions_path: Path = FARM_HISTORY_SUGGESTIONS_FILE,
+) -> int:
+    if not closed_farms:
+        return 0
+    existing_suggestions = load_farm_history(suggestions_path)
+    known_ids = known_history_ids(history_rows, existing_suggestions)
+    new_rows = []
+    for farm in closed_farms:
+        nft_id = str(farm.get("nft_id", "")).strip().lstrip("#")
+        if not nft_id or nft_id in known_ids:
+            continue
+        new_rows.append(
+            {
+                "nft_id": nft_id,
+                "pair": farm.get("pair") or "",
+                "status": "closed",
+                "realized_weth": farm.get("owed_weth") or 0,
+                "realized_wbtc": farm.get("owed_wbtc") or 0,
+                "realized_usdt": farm.get("owed_usdt") or 0,
+                "realized_usdc": farm.get("owed_usdc") or 0,
+                "notes": "Auto-suggested from closed NFT tokens owed; review before copying to farm_history.csv",
+            }
+        )
+        known_ids.add(nft_id)
+
+    if not new_rows:
+        return 0
+
+    suggestions_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = suggestions_path.exists()
+    with suggestions_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "nft_id",
+                "pair",
+                "status",
+                "realized_weth",
+                "realized_wbtc",
+                "realized_usdt",
+                "realized_usdc",
+                "notes",
+            ],
+        )
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(new_rows)
+    return len(new_rows)
+
+
 def compute_snapshot(
     raw: dict[str, Any],
     timestamp: str,
@@ -742,7 +958,7 @@ def compute_snapshot(
         if gas_usd is not None and total_daily_yield > 0:
             gas_drag_pct = (gas_usd / total_daily_yield) * 100
 
-    stable_value_usd = raw.get("uni_usdt_amount")
+    stable_value_usd = (raw.get("uni_usdt_amount") or 0) + (raw.get("uni_usdc_amount") or 0)
     # TODO: extend stable_buffer to include wallet stables + supplied stables on AAVE
     stable_buffer_pct = (
         stable_value_usd / total_equity * 100
@@ -804,10 +1020,11 @@ def compute_snapshot(
     total_eth_units = eth_aave + eth_wallet + eth_lp_amount
     total_eth_value = total_eth_units * eth_price if eth_price is not None else None
     btc_aave = awbtc_balance or 0
-    total_btc_units = btc_aave
+    btc_lp_amount = raw.get("uni_wbtc_amount") or 0
+    total_btc_units = btc_aave + btc_lp_amount
     total_btc_value = total_btc_units * btc_price if btc_price is not None else None
     # Stable position
-    stable_lp = raw.get("uni_usdt_amount") or 0  # USDT in active LP position
+    stable_lp = (raw.get("uni_usdt_amount") or 0) + (raw.get("uni_usdc_amount") or 0)  # stables in active LP positions
     stable_debt = vdusdt_balance if vdusdt_balance and vdusdt_balance > 0 else debt or 0
     # TODO: if USDC debt is added later, sum here: stable_debt += vdusdc_balance
 
@@ -881,6 +1098,10 @@ def compute_snapshot(
         "uni_usdt_fees": uni_usdt_fees,
         "uni_weth_amount": raw.get("uni_weth_amount"),
         "uni_usdt_amount": raw.get("uni_usdt_amount"),
+        "uni_wbtc_amount": raw.get("uni_wbtc_amount"),
+        "uni_usdc_amount": raw.get("uni_usdc_amount"),
+        "uni_active_farms": raw.get("uni_active_farms") or [],
+        "uni_closed_farms": raw.get("uni_closed_farms") or [],
         "uni_in_range": raw.get("uni_in_range"),
         "uni_tick_lower": raw.get("uni_tick_lower"),
         "uni_tick_upper": raw.get("uni_tick_upper"),
@@ -933,6 +1154,7 @@ def compute_snapshot(
         "total_eth_units": total_eth_units,
         "total_eth_value": total_eth_value,
         "btc_aave": btc_aave,
+        "btc_lp_amount": btc_lp_amount,
         "total_btc_units": total_btc_units,
         "total_btc_value": total_btc_value,
         "stable_lp": stable_lp,
@@ -1349,6 +1571,84 @@ def calc_active_farm_last_24h(history: list[dict[str, Any]], snapshot: dict[str,
     }
 
 
+def range_position_pct(farm: dict[str, Any]) -> float:
+    lower = farm.get("price_lower")
+    upper = farm.get("price_upper")
+    current = farm.get("current_price")
+    if None in (lower, upper, current) or upper == lower:
+        return 50.0
+    return max(0.0, min(100.0, ((current - lower) / (upper - lower)) * 100))
+
+
+def enrich_active_farms(
+    farms: list[dict[str, Any]],
+    farm_history: list[dict[str, Any]],
+    eth_price: float | None,
+    btc_price: float | None,
+) -> list[dict[str, Any]]:
+    enriched = []
+    for farm in farms:
+        realized = sum_farm_history(farm_history, eth_price, btc_price, {str(farm.get("nft_id"))})
+        enriched_farm = dict(farm)
+        enriched_farm["lifetime_weth"] = realized["weth"] + (farm.get("unclaimed_weth") or 0)
+        enriched_farm["lifetime_wbtc"] = realized["wbtc"] + (farm.get("unclaimed_wbtc") or 0)
+        enriched_farm["lifetime_usdt"] = realized["usdt"] + (farm.get("unclaimed_usdt") or 0)
+        enriched_farm["lifetime_usdc"] = realized["usdc"] + (farm.get("unclaimed_usdc") or 0)
+        enriched_farm["lifetime_usd"] = realized["usd"] + (farm.get("unclaimed_usd") or 0)
+        enriched_farm["realized_usd"] = realized["usd"]
+        enriched_farm["csv_rows"] = realized["rows"]
+        enriched.append(enriched_farm)
+    return enriched
+
+
+def build_active_farm_cards(farms: list[dict[str, Any]]) -> str:
+    if not farms:
+        return '<div class="card farm-panel"><h3>No Active Farms</h3><div class="subvalue">No active Uniswap V3 liquidity positions detected.</div></div>'
+
+    cards = []
+    for farm in farms:
+        status_class = "green" if farm.get("in_range") else "red"
+        cards.append(f"""
+      <div class="card farm-panel active-farm-card">
+        <h3>Position &middot; Uniswap NFT #{escape(str(farm.get("nft_id")))}</h3>
+        <div class="farm-split">
+          <div class="uni-grid">
+            <div class="label">Pair</div><div>{escape(farm.get("pair") or "Unknown")}</div>
+            <div class="label">Status</div><div class="{status_class}">{escape(farm.get("status") or "N/A")}</div>
+            <div class="label">Current price</div><div>{whole_money(farm.get("current_price"))}</div>
+            <div class="label">Range</div><div>{whole_money(farm.get("price_lower"))} - {whole_money(farm.get("price_upper"))}</div>
+            <div class="label">Position value</div><div>{money(farm.get("position_value"))}</div>
+          </div>
+          <div class="uni-grid">
+            <div class="label">WETH</div><div>{number(farm.get("weth_amount"), 6)}</div>
+            <div class="label">WBTC</div><div>{number(farm.get("wbtc_amount"), 6)}</div>
+            <div class="label">USDT</div><div>{number(farm.get("usdt_amount"), 2)}</div>
+            <div class="label">USDC</div><div>{number(farm.get("usdc_amount"), 2)}</div>
+            <div class="label">LP stable %</div><div>{percent(farm.get("stable_pct"), 1)}</div>
+          </div>
+        </div>
+        <div class="range-visual">
+          <div class="range-caption">{escape(farm.get("pair") or "Farm")} &middot; <span class="{status_class}">{escape(farm.get("status") or "N/A")}</span></div>
+          <div class="range-labels"><span>{whole_money(farm.get("price_lower"))}</span><span>{whole_money(farm.get("price_upper"))}</span></div>
+          <div class="range-bar" style="--range-position: {range_position_pct(farm):.2f}%"><span class="range-dot"></span></div>
+          <div class="range-now">{whole_money(farm.get("current_price"))}</div>
+        </div>
+        <div class="today-output">
+          <div class="label">Lifetime estimate</div>
+          <div class="farm-output-lines">
+            <div><span class="label">Total</span><strong>{money(farm.get("lifetime_usd"))}</strong></div>
+            <div><span class="label">WETH</span><strong>{number(farm.get("lifetime_weth"), 6)}</strong></div>
+            <div><span class="label">WBTC</span><strong>{number(farm.get("lifetime_wbtc"), 6)}</strong></div>
+            <div><span class="label">USDT</span><strong>{number(farm.get("lifetime_usdt"), 2)}</strong></div>
+            <div><span class="label">USDC</span><strong>{number(farm.get("lifetime_usdc"), 2)}</strong></div>
+            <div><span class="label">Current unclaimed</span><strong>{money(farm.get("unclaimed_usd"))}</strong></div>
+          </div>
+        </div>
+      </div>
+""")
+    return "\n".join(cards)
+
+
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
     chart_rows = []
     realized_lp_fees = 0.0
@@ -1482,6 +1782,20 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
             if cumulative_financing_carry is not None
             else cumulative_lp_fees
         )
+    active_farms = enrich_active_farms(
+        snapshot.get("uni_active_farms") or [],
+        farm_history,
+        snapshot.get("eth_price"),
+        snapshot.get("btc_price"),
+    )
+    active_farms_cards_html = build_active_farm_cards(active_farms)
+    active_farms_value = sum(farm.get("position_value") or 0 for farm in active_farms)
+    active_farms_unclaimed = sum(farm.get("unclaimed_usd") or 0 for farm in active_farms)
+    active_farms_lifetime = sum(farm.get("lifetime_usd") or 0 for farm in active_farms)
+    active_farms_weth = sum(farm.get("lifetime_weth") or 0 for farm in active_farms)
+    active_farms_wbtc = sum(farm.get("lifetime_wbtc") or 0 for farm in active_farms)
+    active_farms_usdt = sum(farm.get("lifetime_usdt") or 0 for farm in active_farms)
+    active_farms_usdc = sum(farm.get("lifetime_usdc") or 0 for farm in active_farms)
     active_farm_lifetime = calc_active_farm_output(history, snapshot)
     if farm_history:
         active_farm_lifetime = {
@@ -1631,6 +1945,8 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .uni-card {{ margin-top: 20px; }}
     .uni-grid {{ display: grid; grid-template-columns: 160px 1fr; gap: 9px 14px; }}
     .active-farm {{ display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 20px; }}
+    .active-farms-list {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
+    .active-farm-card {{ min-height: 0; }}
     .farm-panel {{ min-width: 0; }}
     .farm-panel h3 {{ margin: 0 0 12px; font-size: 15px; }}
     .farm-split {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
@@ -1702,7 +2018,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     footer {{ margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }}
     @media (max-width: 820px) {{
       main {{ width: min(100% - 20px, 1180px); padding: 20px 0; }}
-      .grid, .grid.five, .grid.six, .grid.three, .health-grid, .active-farm, .farm-split, .banner, .two-col {{ grid-template-columns: 1fr; }}
+      .grid, .grid.five, .grid.six, .grid.three, .health-grid, .active-farm, .active-farms-list, .farm-split, .banner, .two-col {{ grid-template-columns: 1fr; }}
       header {{ display: block; }}
       .refresh-btn {{ margin-top: 12px; }}
       h1 {{ font-size: 26px; }}
@@ -1742,60 +2058,15 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">Borrow Room</div><div class="value indigo">{money(snapshot.get("remaining_borrow_room"))}</div><div class="subvalue">AAVE max LTV</div></div>
     </section>
 
-    <h2 class="section-title">ACTIVE FARM</h2>
-    <section class="active-farm">
-      <div class="card farm-panel">
-        <h3>Position &middot; Uniswap NFT {escape(active_ids)}</h3>
-        <div class="subvalue">Uniswap V3 position NFT</div>
-        <div class="farm-split">
-          <div class="uni-grid">
-            <div class="label">Pair</div><div>WETH / USDT 0.3%</div>
-            <div class="label">Current price</div><div>{whole_money(snapshot.get("eth_price"))}</div>
-            <div class="label">Range</div><div>{whole_money(snapshot.get("uni_price_lower"))} - {whole_money(snapshot.get("uni_price_upper"))}</div>
-          </div>
-          <div>
-            <div class="uni-grid">
-              <div class="label">ETH amount</div><div>{number(snapshot.get("uni_weth_amount"), 4)} ETH <span class="muted">({money(uni_weth_value)})</span></div>
-              <div class="label">USDT amount</div><div>{number(snapshot.get("uni_usdt_amount"), 2)} USDT</div>
-              <div class="label">LP stable %</div><div>{percent(lp_stable_pct, 1)}</div>
-              <div class="label">Position value</div><div>{money(snapshot.get("uni_position_value"))}</div>
-            </div>
-          </div>
-        </div>
-        <div class="range-visual">
-          <div class="range-caption">ETH/USDT 0.3% &middot; <span class="{uni_status_class}">{escape(uni_status_text)}</span></div>
-          <div class="range-labels"><span>{whole_money(snapshot.get("uni_price_lower"))}</span><span>{whole_money(snapshot.get("uni_price_upper"))}</span></div>
-          <div class="range-bar" style="--range-position: {range_position:.2f}%"><span class="range-dot"></span></div>
-          <div class="range-now">{whole_money(snapshot.get("eth_price"))}</div>
-        </div>
-      </div>
-      <div class="card farm-panel">
-        <h3>Active Farm Output</h3>
-        <div class="farm-output-value green">{money(active_farm_lifetime.get("usd"))}</div>
-        <div class="subvalue">Active NFT lifetime estimate<br>WETH: {number(active_farm_lifetime.get("weth"), 6)}<br>WBTC: {number(active_farm_lifetime.get("wbtc"), 6)}<br>USDT: {number(active_farm_lifetime.get("usdt"), 2)}<br>USDC: {number(active_farm_lifetime.get("usdc"), 2)}<br>Current unclaimed: {money(active_farm_lifetime.get("unclaimed_usd"))}<br>Unattributed realized USD: {money(active_farm_unattributed_usd)}<br>Estimated USD total: {money(active_farm_lifetime.get("usd"))}</div>
-        <div class="today-output">
-          <div class="label">Last 24h</div>
-          <div class="farm-output-lines">
-            <div><span class="label">Total</span><strong>{signed_money(last_24h_total)}</strong></div>
-            <div><span class="label">LP fees</span><strong>{signed_money(active_farm_24h.get("fees_usd"))}</strong></div>
-            <div><span class="label">WETH fees</span><strong>{signed_asset(active_farm_24h.get("weth"), "WETH")}</strong></div>
-            <div><span class="label">USDT fees</span><strong>{signed_asset(active_farm_24h.get("usdt"), "USDT", 2)}</strong></div>
-            <div><span class="label">Estimated financing carry</span><strong>{signed_money(financing_carry_today)}</strong></div>
-          </div>
-        </div>
-        <div class="uni-grid" style="margin-top: 14px;">
-          <div class="label">Current Farm APY</div><div class="green">{current_farm_apy_value}</div>
-          <div class="label">7d APY</div><div>{apy_value(snapshot.get("apy_7d"))}</div>
-          <div class="label">30d APY</div><div>{apy_value(snapshot.get("apy_30d"))}</div>
-          <div class="label">APY quality</div><div>{escape(snapshot.get("apy_quality", "N/A"))}</div>
-        </div>
-        <h3 style="margin-top: 18px;">Current Unclaimed Fees</h3>
-        <div class="uni-grid">
-          <div class="label">Unclaimed WETH</div><div>{number(snapshot.get("uni_weth_fees"), 6)} WETH</div>
-          <div class="label">Unclaimed USDT</div><div>{number(snapshot.get("uni_usdt_fees"), 2)} USDT</div>
-          <div class="label">Estimated USD</div><div>&asymp; {money(snapshot.get("uni_fees_unclaimed"))}</div>
-        </div>
-      </div>
+    <h2 class="section-title">ACTIVE FARMS</h2>
+    <section class="grid four">
+      <div class="card kpi"><div class="label">Active Farms</div><div class="value">{len(active_farms)}</div><div class="subvalue">Live Uniswap V3 NFTs</div></div>
+      <div class="card kpi"><div class="label">Active Farm Value</div><div class="value">{money(active_farms_value)}</div><div class="subvalue">Current LP deployment</div></div>
+      <div class="card kpi"><div class="label">Active Unclaimed</div><div class="value green">{money(active_farms_unclaimed)}</div><div class="subvalue">Fetched live from The Graph</div></div>
+      <div class="card kpi"><div class="label">Active Lifetime Output</div><div class="value green">{money(active_farms_lifetime)}</div><div class="subvalue">WETH {number(active_farms_weth, 6)} &middot; WBTC {number(active_farms_wbtc, 6)}<br>USDT {number(active_farms_usdt, 2)} &middot; USDC {number(active_farms_usdc, 2)}</div></div>
+    </section>
+    <section class="active-farms-list">
+{active_farms_cards_html}
     </section>
 
     <h2 class="section-title">UNIT ACCUMULATION</h2>
@@ -2068,7 +2339,7 @@ def fetch_all() -> tuple[dict[str, Any], int]:
 
     uni_data, ok = safe_fetch(
         "Uniswap V3 position details",
-        lambda: fetch_uni_position_details(LP_WALLET, raw.get("eth_price")),
+        lambda: fetch_uni_position_details(LP_WALLET, raw.get("eth_price"), raw.get("btc_price")),
     )
     if ok:
         successes += 1
@@ -2081,9 +2352,15 @@ def fetch_all() -> tuple[dict[str, Any], int]:
                 "uni_position_value": None,
                 "uni_fees_unclaimed": None,
                 "uni_weth_fees": None,
+                "uni_wbtc_fees": None,
                 "uni_usdt_fees": None,
+                "uni_usdc_fees": None,
                 "uni_weth_amount": None,
+                "uni_wbtc_amount": None,
                 "uni_usdt_amount": None,
+                "uni_usdc_amount": None,
+                "uni_active_farms": [],
+                "uni_closed_farms": [],
                 "uni_in_range": None,
                 "uni_tick_lower": None,
                 "uni_tick_upper": None,
@@ -2108,6 +2385,13 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     if successes == 0:
         print("Error: all RPC calls failed. No database row written.")
         return False
+
+    suggested_rows = append_farm_history_suggestions(
+        raw.get("uni_closed_farms") or [],
+        load_farm_history(),
+    )
+    if suggested_rows:
+        print(f"Farm history suggestions added: {suggested_rows} row(s) -> data/farm_history_suggestions.csv")
 
     init_db()
     previous_history = get_history(1000)
