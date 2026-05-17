@@ -117,7 +117,7 @@ Six cards at the top — always visible at a glance:
 | Card | What it measures |
 |---|---|
 | Health Factor | AAVE liquidation safety. Target ≥1.80, floor 1.60 |
-| LP Stable Buffer | USDT in LP / total equity. Target ≥25% |
+| LP Stable Buffer | USDT + USDC in LP / total equity. Target ≥25% |
 | Borrow Usage | Debt / max borrow capacity. Target <70% |
 | Current Stage | DeFi Path stage (manually set in config.py) |
 | Risk State | Derived from HF + borrow usage + stable buffer |
@@ -158,7 +158,9 @@ Live Uniswap V3 position + output view. If multiple farms are active, each NFT i
 ### Unit Accumulation
 - Total ETH exposure (AAVE + wallet + LP)
 - Total BTC exposure (AAVE)
-- Net stable position (LP stables − AAVE stable debt)
+- Net stable position (LP USDT + USDC − AAVE USDT + USDC stable debt)
+
+The Net Stable Position card also shows the AAVE stable debt split by USDT and USDC.
 
 ### Core Charts
 1. Total Equity Trend
@@ -210,8 +212,8 @@ All calls are **read-only**. No private keys. No transactions.
 
 **AAVE:**
 - Collateral, debt, equity, HF, LTV
-- Supply APY (WETH) and borrow APY (USDT)
-- Financing carry = estimated borrow cost on stable debt, shown as a negative farm cost
+- Supply APY (WETH) and borrow APY (USDT + USDC)
+- Financing carry = weighted estimated borrow cost on USDT + USDC stable debt, shown as a negative farm cost
 - AAVE carry = supply income − borrow cost, kept for reference
 - Borrow Room = AAVE `availableBorrowsBase` from `getUserAccountData`
 

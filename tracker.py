@@ -36,7 +36,8 @@ SERVER_PORTS = (5050, 5051, 5052)
 AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
 AWETH = "0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8"
 AWBTC = "0x5Ee5bf7ae06D1Be5997A1A72006FE6C607eC6DE8"
-VDUSDT = "0x531842cebfcce26401911cb6d3b170f8b2fc57c6"
+VDUSDT = "0x6df1C1E379bC5a00a7b4C6e67A203333772f45A8"
+VDUSDC = "0x72E95b8931767C79bA4EeE721354d6E99a61D004"
 UNI_V3_NFT_MANAGER = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
 UNI_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 UNI_WETH_USDT_POOL = "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"
@@ -318,6 +319,43 @@ def pair_label(token0: str, token1: str, fee: int) -> str:
 
 def token_amounts_by_symbol(token_amounts: dict[str, float], symbol: str) -> float:
     return token_amounts.get(symbol, 0.0)
+
+
+def stable_debt_components(raw: dict[str, Any]) -> dict[str, float]:
+    return {
+        "USDT": max(0.0, raw.get("vdusdt_balance") or 0.0),
+        "USDC": max(0.0, raw.get("vdusdc_balance") or 0.0),
+    }
+
+
+def stable_debt_total(raw: dict[str, Any]) -> float:
+    components = stable_debt_components(raw)
+    token_total = sum(components.values())
+    if token_total > 0:
+        return token_total
+    return max(0.0, raw.get("aave_debt") or 0.0)
+
+
+def weighted_stable_borrow_cost(raw: dict[str, Any]) -> float | None:
+    components = stable_debt_components(raw)
+    weighted_cost = 0.0
+    weighted_any = False
+    for symbol, balance in components.items():
+        apy = raw.get(f"{symbol.lower()}_borrow_apy")
+        if balance > 0 and apy is not None:
+            weighted_cost += balance * (apy / 100) / 365
+            weighted_any = True
+
+    if weighted_any:
+        return weighted_cost
+
+    debt = raw.get("aave_debt")
+    fallback_apy = raw.get("usdt_borrow_apy")
+    if fallback_apy is None:
+        fallback_apy = raw.get("usdc_borrow_apy")
+    if debt is None or fallback_apy is None:
+        return None
+    return max(0.0, debt) * (fallback_apy / 100) / 365
 
 
 def get_uni_amounts(
@@ -1088,9 +1126,7 @@ def compute_snapshot(
     aweth_balance = raw.get("aweth_balance")
     awbtc_balance = raw.get("awbtc_balance")
     uni_position_value = raw.get("uni_position_value")
-    vdusdt_balance = raw.get("vdusdt_balance")
     eth_supply_apy = raw.get("eth_supply_apy")
-    usdt_borrow_apy = raw.get("usdt_borrow_apy")
     uni_fees_unclaimed = raw.get("uni_fees_unclaimed")
     uni_weth_fees = raw.get("uni_weth_fees")
     uni_usdt_fees = raw.get("uni_usdt_fees")
@@ -1153,14 +1189,11 @@ def compute_snapshot(
             correlated_liq_price_eth = eth_price * (1 - correlated_liq_drop_pct / 100)
             correlated_liq_price_btc = btc_price * (1 - correlated_liq_drop_pct / 100)
 
-    stable_borrow_principal = (
-        vdusdt_balance
-        if vdusdt_balance is not None and vdusdt_balance > 0
-        else debt
-    )
-    if None not in (aweth_balance, eth_price, eth_supply_apy, stable_borrow_principal, usdt_borrow_apy):
+    stable_borrow_principal = stable_debt_total(raw)
+    stable_borrow_cost = weighted_stable_borrow_cost(raw)
+    if None not in (aweth_balance, eth_price, eth_supply_apy, stable_borrow_cost):
         aave_daily_supply_income = aweth_balance * eth_price * (eth_supply_apy / 100) / 365
-        aave_daily_borrow_cost = stable_borrow_principal * (usdt_borrow_apy / 100) / 365
+        aave_daily_borrow_cost = stable_borrow_cost
         # Financing carry is the estimated daily cost of borrowed stables used to fund the farm.
         daily_financing_carry = -aave_daily_borrow_cost
         aave_daily_carry = (
@@ -1245,10 +1278,8 @@ def compute_snapshot(
     total_btc_value = total_btc_units * btc_price if btc_price is not None else None
     # Stable position
     stable_lp = (raw.get("uni_usdt_amount") or 0) + (raw.get("uni_usdc_amount") or 0)  # stables in active LP positions
-    stable_debt = vdusdt_balance if vdusdt_balance and vdusdt_balance > 0 else debt or 0
-    # TODO: if USDC debt is added later, sum here: stable_debt += vdusdc_balance
-
-    stable_debt_usd = stable_debt  # USDT is 1:1 USD
+    stable_debt = stable_borrow_principal
+    stable_debt_usd = debt if debt is not None and sum(stable_debt_components(raw).values()) > 0 else stable_debt
     net_stable = stable_lp - stable_debt_usd
     prev_realized_usd = (previous_snapshot or {}).get("cumulative_realized_fees_usd") or 0
     prev_realized_eth = (previous_snapshot or {}).get("cumulative_realized_fees_eth") or 0
@@ -1307,7 +1338,8 @@ def compute_snapshot(
         "ltv_pct": ltv_pct,
         "aweth_balance": aweth_balance,
         "awbtc_balance": awbtc_balance,
-        "vdusdt_balance": vdusdt_balance,
+        "vdusdt_balance": raw.get("vdusdt_balance"),
+        "vdusdc_balance": raw.get("vdusdc_balance"),
         "uni_positions": raw.get("uni_positions"),
         "uni_position_ids": raw.get("uni_position_ids"),
         "uni_active_position_ids": raw.get("uni_active_position_ids"),
@@ -1334,7 +1366,8 @@ def compute_snapshot(
         "correlated_liq_price_eth": correlated_liq_price_eth,
         "correlated_liq_price_btc": correlated_liq_price_btc,
         "eth_supply_apy": eth_supply_apy,
-        "usdt_borrow_apy": usdt_borrow_apy,
+        "usdt_borrow_apy": raw.get("usdt_borrow_apy"),
+        "usdc_borrow_apy": raw.get("usdc_borrow_apy"),
         "aave_daily_carry": aave_daily_carry,
         "aave_daily_supply_income": aave_daily_supply_income,
         "aave_daily_borrow_cost": aave_daily_borrow_cost,
@@ -1656,13 +1689,10 @@ def build_risk_alerts(snapshot: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def row_financing_carry(row: dict[str, Any]) -> float | None:
-    debt = row.get("vdusdt_balance")
-    if debt is None or debt <= 0:
-        debt = row.get("aave_debt")
-    borrow_apy = row.get("usdt_borrow_apy")
-    if debt is None or borrow_apy is None:
+    cost = weighted_stable_borrow_cost(row)
+    if cost is None:
         return None
-    return -(debt * (borrow_apy / 100) / 365)
+    return -cost
 
 
 def calc_fee_accounting_seed(history: list[dict[str, Any]]) -> dict[str, float]:
@@ -2323,7 +2353,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     <h2 class="section-title">SYSTEM HEALTH</h2>
     <section class="health-grid">
       <div class="card kpi"><div class="label">Health Factor</div><div class="value {banner_class}">{number(hf, 3)}</div><div class="subvalue">Target &ge;1.80 &middot; Floor 1.60</div></div>
-      <div class="card kpi"><div class="label">LP Stable Buffer</div><div class="value {stable_class}">{percent(snapshot.get("stable_buffer_pct"), 1)}</div><div class="subvalue">Currently counts USDT inside active LP only.</div></div>
+      <div class="card kpi"><div class="label">LP Stable Buffer</div><div class="value {stable_class}">{percent(snapshot.get("stable_buffer_pct"), 1)}</div><div class="subvalue">Counts USDT + USDC inside active LP.</div></div>
       <div class="card kpi"><div class="label">Borrow Usage</div><div class="value {borrow_usage_class}">{percent(snapshot.get("borrow_usage_pct"), 1)}</div><div class="subvalue">Capacity {whole_money(snapshot.get("max_borrow_capacity"))} &middot; Used {whole_money(snapshot.get("aave_debt"))}</div></div>
       <div class="card kpi"><div class="label">Current Stage</div><div class="value indigo">{escape(snapshot.get("current_stage") or CURRENT_STAGE)}</div><div class="subvalue">DeFi Path</div></div>
       <div class="card kpi"><div class="label">Risk State</div><div class="value {risk_state_color}">{escape(snapshot.get("risk_state", "N/A"))}</div><div class="subvalue">{escape(risk_state_note)}</div></div>
@@ -2356,7 +2386,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     <section class="grid three">
       <div class="card kpi"><div class="label">Total ETH Exposure</div><div class="value">{number(snapshot.get("total_eth_units"), 4)} ETH <span class="muted">({money(snapshot.get("total_eth_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("eth_aave"), 4)} permanent core collateral<br>LP exposure: {number(snapshot.get("eth_lp_amount"), 4)} active farm exposure, funded by borrowed stables<br>Wallet: {number(snapshot.get("eth_wallet"), 4)}</div></div>
       <div class="card kpi"><div class="label">Total BTC Exposure</div><div class="value">{number(snapshot.get("total_btc_units"), 6)} BTC <span class="muted">({money(snapshot.get("total_btc_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("btc_aave"), 6)} permanent core collateral<br>LP BTC exposure: 0.000000 active farm exposure</div></div>
-      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}<br>Net stable: {money(snapshot.get("net_stable"))}</div></div>
+      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}<br>USDT debt: -{money(snapshot.get("vdusdt_balance"))}<br>USDC debt: -{money(snapshot.get("vdusdc_balance"))}</div></div>
     </section>
 {gas_row}
 
@@ -2598,6 +2628,7 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         ("aWETH balance", "aweth_balance", lambda: fetch_token_balance(AWETH, MAIN_WALLET, 18)),
         ("aWBTC balance", "awbtc_balance", lambda: fetch_token_balance(AWBTC, MAIN_WALLET, 8)),
         ("vdUSDT balance", "vdusdt_balance", lambda: fetch_token_balance(VDUSDT, MAIN_WALLET, 6)),
+        ("vdUSDC balance", "vdusdc_balance", lambda: fetch_token_balance(VDUSDC, MAIN_WALLET, 6)),
     ]
 
     aave_data, ok = safe_fetch("AAVE user data", lambda: fetch_aave_user_data(MAIN_WALLET))
@@ -2620,6 +2651,13 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         raw["usdt_borrow_apy"] = usdt_rates["borrow_apy_pct"]
     else:
         raw["usdt_borrow_apy"] = None
+
+    usdc_rates, ok = safe_fetch("AAVE USDC reserve rates", lambda: fetch_aave_reserve_rates(USDC))
+    if ok:
+        successes += 1
+        raw["usdc_borrow_apy"] = usdc_rates["borrow_apy_pct"]
+    else:
+        raw["usdc_borrow_apy"] = None
 
     for label, key, fetcher in fetches:
         value, ok = safe_fetch(label, fetcher)
@@ -2706,6 +2744,9 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print("AAVE Rates:")
     print(f"  WETH supply APY:   {percent(snapshot.get('eth_supply_apy'), 2)}")
     print(f"  USDT borrow APY:   {percent(snapshot.get('usdt_borrow_apy'), 2)}")
+    print(f"  USDC borrow APY:   {percent(snapshot.get('usdc_borrow_apy'), 2)}")
+    print(f"  USDT debt:         {money(snapshot.get('vdusdt_balance'))}")
+    print(f"  USDC debt:         {money(snapshot.get('vdusdc_balance'))}")
     print(f"  Daily carry:       {money(snapshot.get('aave_daily_carry'))}")
     print("Yield today:")
     print(f"  LP fee yield:      {money(snapshot.get('uni_daily_fee_yield'))}")
@@ -2718,6 +2759,7 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print(f"  Status:         {uni_status_text}")
     print(f"  WETH:           {number(snapshot.get('uni_weth_amount'), 4)} ETH")
     print(f"  USDT:           {number(snapshot.get('uni_usdt_amount'), 2)} USDT")
+    print(f"  USDC:           {number(snapshot.get('uni_usdc_amount'), 2)} USDC")
     print(f"  Position value: {money(snapshot.get('uni_position_value'))}")
     weth_fee_usd = (
         snapshot["uni_weth_fees"] * snapshot["eth_price"]
