@@ -1,4 +1,4 @@
-nft_id,pair,status,realized_weth,realized_wbtc,realized_usdt,realized_usdc,notes
-1147472,ETH/USDT,closed,0.000000,0.000000,0.00,0.00,Example old ETH/USDT farm
-1198334,BTC/USDT,closed,0.000000,0.000000,0.00,0.00,Example old BTC/USDT farm
-1269178,ETH/USDT,active,0.000000,0.000000,0.00,0.00,Current active farm realized fees only
+nft_id,pair,stage,status,input_usd,output_usd,input_weth,input_wbtc,input_usdt,input_usdc,output_weth,output_wbtc,output_usdt,output_usdc,notes
+1269178,WETH/USDT,Stage 1,active,8000,0,1.20,0,4000,0,0,0,0,0,Current active farm input seed; current output is estimated live
+1147472,WETH/USDT,Stage 1,closed,5000,5420,0.80,0,2500,0,0.84,0,2680,0,Old ETH farm deployment result
+1198334,WBTC/USDT,Stage 2,closed,6000,6420,0,0.11,3000,0,0,0.118,3250,0,BTC accumulation deployment result

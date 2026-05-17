@@ -74,7 +74,7 @@ Press `Ctrl+C` to stop the server.
 
 ## Manual farm history CSV
 
-Optional, but recommended if you have closed/collected old farms.
+Optional, but recommended if you want operator-grade deployment accounting.
 
 Create your own file from the example:
 ```bash
@@ -83,23 +83,29 @@ cp data/farm_history.example.csv data/farm_history.csv
 
 Fill in one row per Uniswap NFT/farm:
 ```csv
-nft_id,pair,status,realized_weth,realized_wbtc,realized_usdt,realized_usdc,notes
-1269178,ETH/USDT,active,0.0012,0,45.50,0,Collected fees from current farm
-1198334,BTC/USDT,closed,0,0.0004,28.00,0,Old BTC/USDT farm
+nft_id,pair,stage,status,input_usd,output_usd,input_weth,input_wbtc,input_usdt,input_usdc,output_weth,output_wbtc,output_usdt,output_usdc,notes
+1269178,WETH/USDT,Stage 1,active,8000,0,1.20,0,4000,0,0,0,0,0,Current active farm input seed
+1147472,WETH/USDT,Stage 1,closed,5000,5420,0.80,0,2500,0,0.84,0,2680,0,Old ETH farm deployment result
+1198334,WBTC/USDT,Stage 2,closed,6000,6420,0,0.11,3000,0,0,0.118,3250,0,BTC accumulation
 ```
 
-Use realized/collected fees only. Current unclaimed fees are fetched live and added separately by `tracker.py`.
+This file is an operator ledger, not tax accounting:
+- Input = what was deployed when the farm started.
+- Output = what was received when the farm closed, collected, or was manually recorded.
+- Result = output minus input.
+
+For active farms, seed the input fields manually. The dashboard uses the live LP value plus current unclaimed fees as the current output estimate.
 
 If `data/farm_history.csv` is missing, the dashboard still runs and uses live/snapshot data only.
 
-The CSV is for realized/collected fees only. Do not enter current unclaimed fees here; those are fetched live.
+Do not enter current unclaimed fees for active farms here; those are fetched live.
 
 When a farm appears closed and is not already in your manual history, the tracker may create:
 ```text
 data/farm_history_suggestions.csv
 ```
 
-Review suggested rows before copying them into `data/farm_history.csv`. Suggestions are best-effort and are not treated as final accounting.
+Review suggested rows before copying them into `data/farm_history.csv`. Suggestions are passive helpers and are not treated as final accounting.
 
 ---
 
@@ -111,7 +117,7 @@ Six cards at the top — always visible at a glance:
 | Card | What it measures |
 |---|---|
 | Health Factor | AAVE liquidation safety. Target ≥1.80, floor 1.60 |
-| LP Stable Buffer | USDT in LP / total equity. Target ≥25% |
+| LP Stable Buffer | USDT + USDC in LP / total equity. Target ≥25% |
 | Borrow Usage | Debt / max borrow capacity. Target <70% |
 | Current Stage | DeFi Path stage (manually set in config.py) |
 | Risk State | Derived from HF + borrow usage + stable buffer |
@@ -145,21 +151,23 @@ Live Uniswap V3 position + output view. If multiple farms are active, each NFT i
 - Collateral growth 30d
 - Debt growth 30d
 - Net flywheel expansion (collateral growth − debt growth)
-- Lifetime Strategy Output across all farms
-- Lifetime Financing Carry as estimated interest on borrowed stables
-- Borrow Room (remaining capacity from AAVE)
+- Gross Farm Result from the farm ledger before financing: input, output/current, result, ETH delta, BTC delta, stable delta
+- Financing Carry as estimated stable debt interest; negative means net borrowing cost
+- Net Strategy Output = Gross Farm Result + Financing Carry
 
 ### Unit Accumulation
 - Total ETH exposure (AAVE + wallet + LP)
 - Total BTC exposure (AAVE)
-- Net stable position (LP stables − AAVE stable debt)
+- Net stable position (LP USDT + USDC − AAVE USDT + USDC stable debt)
+
+The Net Stable Position card also shows the AAVE stable debt split by USDT and USDC.
 
 ### Core Charts
 1. Total Equity Trend
 2. LTV Over Time
 3. Farm APY Trend
 4. Daily Yield Breakdown (LP fees + AAVE carry)
-5. Cumulative Farm Output
+5. Cumulative Fee Snapshot
 6. Unit Accumulation Over Time (ETH + BTC)
 
 ### Strategy vs HODL
@@ -204,8 +212,8 @@ All calls are **read-only**. No private keys. No transactions.
 
 **AAVE:**
 - Collateral, debt, equity, HF, LTV
-- Supply APY (WETH) and borrow APY (USDT)
-- Financing carry = estimated borrow cost on stable debt, shown as a negative farm cost
+- Supply APY (WETH) and borrow APY (USDT + USDC)
+- Financing carry = weighted estimated borrow cost on USDT + USDC stable debt, shown as a negative farm cost
 - AAVE carry = supply income − borrow cost, kept for reference
 - Borrow Room = AAVE `availableBorrowsBase` from `getUserAccountData`
 
@@ -221,7 +229,7 @@ All calls are **read-only**. No private keys. No transactions.
 - In/out of range status
 - Unclaimed fees via The Graph subgraph
 - Daily fee yield = difference from previous snapshot
-- Optional manual realized fee history from `data/farm_history.csv`
+- Optional manual deployment ledger from `data/farm_history.csv`
 
 **Portfolio:**
 - Total equity = AAVE equity + ETH balances + LP value

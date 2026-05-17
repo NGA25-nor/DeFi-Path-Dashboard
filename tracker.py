@@ -36,7 +36,8 @@ SERVER_PORTS = (5050, 5051, 5052)
 AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
 AWETH = "0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8"
 AWBTC = "0x5Ee5bf7ae06D1Be5997A1A72006FE6C607eC6DE8"
-VDUSDT = "0x531842cebfcce26401911cb6d3b170f8b2fc57c6"
+VDUSDT = "0x6df1C1E379bC5a00a7b4C6e67A203333772f45A8"
+VDUSDC = "0x72E95b8931767C79bA4EeE721354d6E99a61D004"
 UNI_V3_NFT_MANAGER = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
 UNI_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 UNI_WETH_USDT_POOL = "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"
@@ -78,6 +79,23 @@ TOKEN_META = {
     USDT.lower(): {"symbol": "USDT", "decimals": 6, "price_key": "stable"},
     USDC.lower(): {"symbol": "USDC", "decimals": 6, "price_key": "stable"},
 }
+FARM_HISTORY_FIELDS = [
+    "nft_id",
+    "pair",
+    "stage",
+    "status",
+    "input_usd",
+    "output_usd",
+    "input_weth",
+    "input_wbtc",
+    "input_usdt",
+    "input_usdc",
+    "output_weth",
+    "output_wbtc",
+    "output_usdt",
+    "output_usdc",
+    "notes",
+]
 
 
 class RpcError(Exception):
@@ -301,6 +319,43 @@ def pair_label(token0: str, token1: str, fee: int) -> str:
 
 def token_amounts_by_symbol(token_amounts: dict[str, float], symbol: str) -> float:
     return token_amounts.get(symbol, 0.0)
+
+
+def stable_debt_components(raw: dict[str, Any]) -> dict[str, float]:
+    return {
+        "USDT": max(0.0, raw.get("vdusdt_balance") or 0.0),
+        "USDC": max(0.0, raw.get("vdusdc_balance") or 0.0),
+    }
+
+
+def stable_debt_total(raw: dict[str, Any]) -> float:
+    components = stable_debt_components(raw)
+    token_total = sum(components.values())
+    if token_total > 0:
+        return token_total
+    return max(0.0, raw.get("aave_debt") or 0.0)
+
+
+def weighted_stable_borrow_cost(raw: dict[str, Any]) -> float | None:
+    components = stable_debt_components(raw)
+    weighted_cost = 0.0
+    weighted_any = False
+    for symbol, balance in components.items():
+        apy = raw.get(f"{symbol.lower()}_borrow_apy")
+        if balance > 0 and apy is not None:
+            weighted_cost += balance * (apy / 100) / 365
+            weighted_any = True
+
+    if weighted_any:
+        return weighted_cost
+
+    debt = raw.get("aave_debt")
+    fallback_apy = raw.get("usdt_borrow_apy")
+    if fallback_apy is None:
+        fallback_apy = raw.get("usdc_borrow_apy")
+    if debt is None or fallback_apy is None:
+        return None
+    return max(0.0, debt) * (fallback_apy / 100) / 365
 
 
 def get_uni_amounts(
@@ -664,6 +719,12 @@ def signed_money(value: float | None) -> str:
     return f"{sign}${abs(value):,.2f}"
 
 
+def signed_stable_delta(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{signed_money(value)} stable delta"
+
+
 def signed_asset(value: float | None, symbol: str, digits: int = 6) -> str:
     if value is None:
         return "N/A"
@@ -749,17 +810,73 @@ def load_farm_history(path: Path = FARM_HISTORY_FILE) -> list[dict[str, Any]]:
                     {
                         "nft_id": nft_id,
                         "pair": (row.get("pair") or "").strip(),
+                        "stage": (row.get("stage") or "").strip(),
                         "status": (row.get("status") or "").strip(),
-                        "realized_weth": parse_float(row.get("realized_weth")),
-                        "realized_wbtc": parse_float(row.get("realized_wbtc")),
-                        "realized_usdt": parse_float(row.get("realized_usdt")),
-                        "realized_usdc": parse_float(row.get("realized_usdc")),
+                        "input_usd": parse_float(row.get("input_usd")),
+                        "output_usd": parse_float(row.get("output_usd")),
+                        "input_weth": parse_float(row.get("input_weth")),
+                        "input_wbtc": parse_float(row.get("input_wbtc")),
+                        "input_usdt": parse_float(row.get("input_usdt")),
+                        "input_usdc": parse_float(row.get("input_usdc")),
+                        "output_weth": parse_float(row.get("output_weth") or row.get("realized_weth")),
+                        "output_wbtc": parse_float(row.get("output_wbtc") or row.get("realized_wbtc")),
+                        "output_usdt": parse_float(row.get("output_usdt") or row.get("realized_usdt")),
+                        "output_usdc": parse_float(row.get("output_usdc") or row.get("realized_usdc")),
                         "notes": (row.get("notes") or "").strip(),
                     }
                 )
     except OSError:
         return []
     return rows
+
+
+def write_farm_history(rows: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=FARM_HISTORY_FIELDS,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def row_output_usd(row: dict[str, Any], eth_price: float | None, btc_price: float | None) -> float:
+    if row.get("output_usd"):
+        return row.get("output_usd") or 0
+    usd = (row.get("output_usdt") or 0) + (row.get("output_usdc") or 0)
+    if eth_price is not None:
+        usd += (row.get("output_weth") or 0) * eth_price
+    if btc_price is not None:
+        usd += (row.get("output_wbtc") or 0) * btc_price
+    return usd
+
+
+def row_input_usd(row: dict[str, Any], eth_price: float | None, btc_price: float | None) -> float:
+    if row.get("input_usd"):
+        return row.get("input_usd") or 0
+    usd = (row.get("input_usdt") or 0) + (row.get("input_usdc") or 0)
+    if eth_price is not None:
+        usd += (row.get("input_weth") or 0) * eth_price
+    if btc_price is not None:
+        usd += (row.get("input_wbtc") or 0) * btc_price
+    return usd
+
+
+def farm_stable_delta(row: dict[str, Any]) -> float:
+    return (row.get("output_usdt") or 0) + (row.get("output_usdc") or 0) - (
+        (row.get("input_usdt") or 0) + (row.get("input_usdc") or 0)
+    )
+
+
+def find_farm_history_row(rows: list[dict[str, Any]], nft_id: Any) -> dict[str, Any] | None:
+    target = str(nft_id or "").strip().lstrip("#")
+    if not target:
+        return None
+    for row in rows:
+        if row.get("nft_id") == target:
+            return row
+    return None
 
 
 def sum_farm_history(
@@ -772,23 +889,252 @@ def sum_farm_history(
         row for row in rows
         if nft_ids is None or row.get("nft_id") in nft_ids
     ]
-    weth = sum(row.get("realized_weth") or 0 for row in selected_rows)
-    wbtc = sum(row.get("realized_wbtc") or 0 for row in selected_rows)
-    usdt = sum(row.get("realized_usdt") or 0 for row in selected_rows)
-    usdc = sum(row.get("realized_usdc") or 0 for row in selected_rows)
-    usd = usdt + usdc
-    if eth_price is not None:
-        usd += weth * eth_price
-    if btc_price is not None:
-        usd += wbtc * btc_price
+    input_usd = sum(row_input_usd(row, eth_price, btc_price) for row in selected_rows)
+    output_usd = sum(row_output_usd(row, eth_price, btc_price) for row in selected_rows)
+    input_weth = sum(row.get("input_weth") or 0 for row in selected_rows)
+    input_wbtc = sum(row.get("input_wbtc") or 0 for row in selected_rows)
+    input_usdt = sum(row.get("input_usdt") or 0 for row in selected_rows)
+    input_usdc = sum(row.get("input_usdc") or 0 for row in selected_rows)
+    output_weth = sum(row.get("output_weth") or 0 for row in selected_rows)
+    output_wbtc = sum(row.get("output_wbtc") or 0 for row in selected_rows)
+    output_usdt = sum(row.get("output_usdt") or 0 for row in selected_rows)
+    output_usdc = sum(row.get("output_usdc") or 0 for row in selected_rows)
     return {
-        "weth": weth,
-        "wbtc": wbtc,
-        "usdt": usdt,
-        "usdc": usdc,
-        "usd": usd,
+        "input_usd": input_usd,
+        "output_usd": output_usd,
+        "net_usd": output_usd - input_usd,
+        "input_weth": input_weth,
+        "input_wbtc": input_wbtc,
+        "input_usdt": input_usdt,
+        "input_usdc": input_usdc,
+        "output_weth": output_weth,
+        "output_wbtc": output_wbtc,
+        "output_usdt": output_usdt,
+        "output_usdc": output_usdc,
+        "eth_delta": output_weth - input_weth,
+        "btc_delta": output_wbtc - input_wbtc,
+        "stable_delta": (output_usdt + output_usdc) - (input_usdt + input_usdc),
         "rows": len(selected_rows),
     }
+
+
+def calc_strategy_output(
+    farm_history: list[dict[str, Any]],
+    active_farms: list[dict[str, Any]],
+    financing_carry_usd: float | None,
+    eth_price: float | None,
+    btc_price: float | None,
+) -> dict[str, float]:
+    closed_farm_history = [
+        row for row in farm_history
+        if (row.get("status") or "").lower() != "active"
+    ]
+    closed_lifetime = sum_farm_history(closed_farm_history, eth_price, btc_price)
+    configured_active_farms = [
+        farm for farm in active_farms
+        if farm.get("input_configured")
+        and (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
+    ]
+    gross_input_usd = closed_lifetime["input_usd"] + sum(
+        farm.get("input_usd") or 0 for farm in configured_active_farms
+    )
+    gross_output_usd = closed_lifetime["output_usd"] + sum(
+        farm.get("current_output_usd") or 0 for farm in configured_active_farms
+    )
+    gross_result_usd = closed_lifetime["net_usd"] + sum(
+        farm.get("farm_result_usd") or 0 for farm in configured_active_farms
+    )
+    carry = financing_carry_usd or 0
+    return {
+        "input_usd": gross_input_usd,
+        "gross_output_usd": gross_output_usd,
+        "gross_result_usd": gross_result_usd,
+        "financing_carry_usd": carry,
+        "net_result_usd": gross_result_usd + carry,
+        "eth_delta": closed_lifetime["eth_delta"] + sum(
+            farm.get("eth_delta") or 0 for farm in configured_active_farms
+        ),
+        "btc_delta": closed_lifetime["btc_delta"] + sum(
+            farm.get("btc_delta") or 0 for farm in configured_active_farms
+        ),
+        "stable_delta": closed_lifetime["stable_delta"] + sum(
+            farm.get("stable_delta") or 0 for farm in configured_active_farms
+        ),
+        "closed_rows": closed_lifetime["rows"],
+        "active_configured_rows": len(configured_active_farms),
+    }
+
+
+def farm_history_row_usd(row: dict[str, Any], eth_price: float | None, btc_price: float | None) -> float:
+    return row_output_usd(row, eth_price, btc_price)
+
+
+def build_farm_history_review(
+    history_rows: list[dict[str, Any]],
+    suggestion_rows: list[dict[str, Any]],
+    closed_farms: list[dict[str, Any]],
+    active_farms: list[dict[str, Any]],
+    eth_price: float | None,
+    btc_price: float | None,
+) -> dict[str, Any]:
+    confirmed_ids = known_history_ids(history_rows)
+    suggestion_ids = known_history_ids(suggestion_rows)
+    active_by_id = {
+        str(farm.get("nft_id") or "").strip().lstrip("#"): farm
+        for farm in active_farms
+    }
+    review_rows = []
+
+    for row in history_rows:
+        review_row = dict(row)
+        nft_id = str(row.get("nft_id") or "").strip().lstrip("#")
+        live_farm = active_by_id.get(nft_id) if (row.get("status") or "").lower() == "active" else None
+        review_row["source"] = "Confirmed"
+        review_row["source_class"] = "green"
+        review_row["input_estimated_usd"] = row_input_usd(row, eth_price, btc_price)
+        review_row["value_label"] = "Current Value" if live_farm else "Final Output"
+        review_row["estimated_usd"] = (
+            live_farm.get("current_output_usd")
+            if live_farm
+            else farm_history_row_usd(row, eth_price, btc_price)
+        )
+        if live_farm:
+            review_row["output_weth"] = (live_farm.get("weth_amount") or 0) + (live_farm.get("unclaimed_weth") or 0)
+            review_row["output_wbtc"] = (live_farm.get("wbtc_amount") or 0) + (live_farm.get("unclaimed_wbtc") or 0)
+            review_row["output_usdt"] = (live_farm.get("usdt_amount") or 0) + (live_farm.get("unclaimed_usdt") or 0)
+            review_row["output_usdc"] = (live_farm.get("usdc_amount") or 0) + (live_farm.get("unclaimed_usdc") or 0)
+            review_row["notes"] = review_row.get("notes") or "Live active farm; current value used for result."
+        review_rows.append(review_row)
+
+    for row in suggestion_rows:
+        nft_id = str(row.get("nft_id", "")).strip().lstrip("#")
+        if not nft_id or nft_id in confirmed_ids:
+            continue
+        review_row = dict(row)
+        estimated_from_events = "Estimated from" in (review_row.get("notes") or "")
+        review_row["source"] = "Est. events" if estimated_from_events else "Needs review"
+        review_row["source_class"] = "amber"
+        review_row["input_estimated_usd"] = row_input_usd(row, eth_price, btc_price)
+        review_row["value_label"] = "Final Output"
+        review_row["estimated_usd"] = farm_history_row_usd(row, eth_price, btc_price)
+        review_rows.append(review_row)
+
+    detected_count = 0
+    for farm in closed_farms:
+        nft_id = str(farm.get("nft_id", "")).strip().lstrip("#")
+        if not nft_id or nft_id in confirmed_ids or nft_id in suggestion_ids:
+            continue
+        row = {
+            "nft_id": nft_id,
+            "pair": farm.get("pair") or "",
+            "stage": "",
+            "status": "closed",
+            "input_usd": 0,
+            "output_usd": 0,
+            "input_weth": 0,
+            "input_wbtc": 0,
+            "input_usdt": 0,
+            "input_usdc": 0,
+            "output_weth": farm.get("owed_weth") or 0,
+            "output_wbtc": farm.get("owed_wbtc") or 0,
+            "output_usdt": farm.get("owed_usdt") or 0,
+            "output_usdc": farm.get("owed_usdc") or 0,
+            "notes": "Detected closed NFT with tokens owed; refresh may add it to suggestions.",
+        }
+        row["source"] = "Detected"
+        row["source_class"] = "blue"
+        row["input_estimated_usd"] = row_input_usd(row, eth_price, btc_price)
+        row["value_label"] = "Final Output"
+        row["estimated_usd"] = farm_history_row_usd(row, eth_price, btc_price)
+        review_rows.append(row)
+        detected_count += 1
+
+    confirmed_net_usd = sum(
+        (row.get("estimated_usd") or 0) - (row.get("input_estimated_usd") or 0)
+        for row in review_rows
+        if row.get("source") == "Confirmed"
+    )
+    confirmed_value_usd = sum(
+        row.get("estimated_usd") or 0
+        for row in review_rows
+        if row.get("source") == "Confirmed"
+    )
+    pending_suggestions = [
+        row for row in suggestion_rows
+        if str(row.get("nft_id", "")).strip().lstrip("#") not in confirmed_ids
+    ]
+    return {
+        "rows": review_rows,
+        "confirmed_count": len(history_rows),
+        "pending_count": len(pending_suggestions),
+        "detected_count": detected_count,
+        "confirmed_usd": confirmed_value_usd,
+        "confirmed_net_usd": confirmed_net_usd,
+    }
+
+
+def build_farm_history_review_section(review: dict[str, Any]) -> str:
+    rows = [
+        row for row in (review.get("rows") or [])
+        if row.get("source") != "Confirmed"
+    ]
+    extra_rows = max(0, len(rows) - 1)
+    toggle_html = (
+        f'<button class="review-toggle" type="button" onclick="toggleExpandableTable(this)" data-count="{extra_rows}">Show all {len(rows)} rows</button>'
+        if extra_rows
+        else ""
+    )
+    queue_html = ""
+    if rows:
+        body = "\n".join(
+            f"""
+            <tr{(' class="review-extra-row"' if index > 0 else '')}>
+              <td>#{escape(str(row.get("nft_id") or ""))}</td>
+              <td>{escape(row.get("pair") or "Unknown")}</td>
+              <td><span class="pill {escape(row.get("source_class") or "muted")}">{escape(row.get("source") or "Unknown")}</span></td>
+              <td>{escape(row.get("stage") or "N/A")}</td>
+              <td>{escape(row.get("status") or "N/A")}</td>
+              <td>{money(row.get("input_estimated_usd"))}</td>
+              <td><span class="value-label">{escape(row.get("value_label") or "Value")}</span>{money(row.get("estimated_usd"))}</td>
+              <td>{signed_money((row.get("estimated_usd") or 0) - (row.get("input_estimated_usd") or 0))}</td>
+              <td>{signed_asset((row.get("output_weth") or 0) - (row.get("input_weth") or 0), "WETH", 6)}</td>
+              <td>{signed_asset((row.get("output_wbtc") or 0) - (row.get("input_wbtc") or 0), "WBTC", 6)}</td>
+              <td>{signed_stable_delta(farm_stable_delta(row))}</td>
+              <td>{escape(row.get("notes") or "")}</td>
+            </tr>"""
+            for index, row in enumerate(rows)
+        )
+        queue_html = f"""
+    <h2 class="section-title">REVIEW QUEUE</h2>
+    <section class="card history-review">
+      <div class="history-review-head">
+        <h2>Review queue</h2>
+        <div class="history-review-actions">
+          <div class="subvalue">Pending helper rows only. Confirmed farms live in the per-farm ledger.</div>
+          {toggle_html}
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>NFT</th><th>Pair</th><th>Source</th><th>Stage</th><th>Status</th><th>Input</th><th>Value</th><th>Result</th><th>ETH Delta</th><th>BTC Delta</th><th>Stable Delta</th><th>Notes</th></tr></thead>
+          <tbody>
+{body}
+          </tbody>
+        </table>
+      </div>
+    </section>
+"""
+
+    return f"""
+    <h2 class="section-title">FARM HISTORY SUMMARY</h2>
+    <section class="grid four">
+      <div class="card kpi"><div class="label">Confirmed Rows</div><div class="value">{review.get("confirmed_count", 0)}</div><div class="subvalue">Rows counted from farm_history.csv</div></div>
+      <div class="card kpi"><div class="label">Pending Suggestions</div><div class="value amber">{review.get("pending_count", 0)}</div><div class="subvalue">Review queue appears when pending rows exist</div></div>
+      <div class="card kpi"><div class="label">Detected Closed</div><div class="value blue">{review.get("detected_count", 0)}</div><div class="subvalue">Live closed NFTs not yet tracked</div></div>
+      <div class="card kpi"><div class="label">Confirmed Result</div><div class="value green">{signed_money(review.get("confirmed_net_usd"))}</div><div class="subvalue">Closed final output plus active current value</div></div>
+    </section>
+{queue_html}
+"""
 
 
 def known_history_ids(*row_groups: list[dict[str, Any]]) -> set[str]:
@@ -812,16 +1158,24 @@ def append_farm_history_suggestions(
         nft_id = str(farm.get("nft_id", "")).strip().lstrip("#")
         if not nft_id or nft_id in known_ids:
             continue
+        note = "Auto-suggested from closed NFT tokens owed; review as closed farm output before copying to farm_history.csv"
         new_rows.append(
             {
                 "nft_id": nft_id,
                 "pair": farm.get("pair") or "",
+                "stage": "",
                 "status": "closed",
-                "realized_weth": farm.get("owed_weth") or 0,
-                "realized_wbtc": farm.get("owed_wbtc") or 0,
-                "realized_usdt": farm.get("owed_usdt") or 0,
-                "realized_usdc": farm.get("owed_usdc") or 0,
-                "notes": "Auto-suggested from closed NFT tokens owed; review before copying to farm_history.csv",
+                "input_usd": 0,
+                "output_usd": 0,
+                "input_weth": 0,
+                "input_wbtc": 0,
+                "input_usdt": 0,
+                "input_usdc": 0,
+                "output_weth": farm.get("owed_weth") or 0,
+                "output_wbtc": farm.get("owed_wbtc") or 0,
+                "output_usdt": farm.get("owed_usdt") or 0,
+                "output_usdc": farm.get("owed_usdc") or 0,
+                "notes": note,
             }
         )
         known_ids.add(nft_id)
@@ -834,16 +1188,7 @@ def append_farm_history_suggestions(
     with suggestions_path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=[
-                "nft_id",
-                "pair",
-                "status",
-                "realized_weth",
-                "realized_wbtc",
-                "realized_usdt",
-                "realized_usdc",
-                "notes",
-            ],
+            fieldnames=FARM_HISTORY_FIELDS,
         )
         if not file_exists:
             writer.writeheader()
@@ -868,9 +1213,7 @@ def compute_snapshot(
     aweth_balance = raw.get("aweth_balance")
     awbtc_balance = raw.get("awbtc_balance")
     uni_position_value = raw.get("uni_position_value")
-    vdusdt_balance = raw.get("vdusdt_balance")
     eth_supply_apy = raw.get("eth_supply_apy")
-    usdt_borrow_apy = raw.get("usdt_borrow_apy")
     uni_fees_unclaimed = raw.get("uni_fees_unclaimed")
     uni_weth_fees = raw.get("uni_weth_fees")
     uni_usdt_fees = raw.get("uni_usdt_fees")
@@ -933,14 +1276,11 @@ def compute_snapshot(
             correlated_liq_price_eth = eth_price * (1 - correlated_liq_drop_pct / 100)
             correlated_liq_price_btc = btc_price * (1 - correlated_liq_drop_pct / 100)
 
-    stable_borrow_principal = (
-        vdusdt_balance
-        if vdusdt_balance is not None and vdusdt_balance > 0
-        else debt
-    )
-    if None not in (aweth_balance, eth_price, eth_supply_apy, stable_borrow_principal, usdt_borrow_apy):
+    stable_borrow_principal = stable_debt_total(raw)
+    stable_borrow_cost = weighted_stable_borrow_cost(raw)
+    if None not in (aweth_balance, eth_price, eth_supply_apy, stable_borrow_cost):
         aave_daily_supply_income = aweth_balance * eth_price * (eth_supply_apy / 100) / 365
-        aave_daily_borrow_cost = stable_borrow_principal * (usdt_borrow_apy / 100) / 365
+        aave_daily_borrow_cost = stable_borrow_cost
         # Financing carry is the estimated daily cost of borrowed stables used to fund the farm.
         daily_financing_carry = -aave_daily_borrow_cost
         aave_daily_carry = (
@@ -1025,10 +1365,8 @@ def compute_snapshot(
     total_btc_value = total_btc_units * btc_price if btc_price is not None else None
     # Stable position
     stable_lp = (raw.get("uni_usdt_amount") or 0) + (raw.get("uni_usdc_amount") or 0)  # stables in active LP positions
-    stable_debt = vdusdt_balance if vdusdt_balance and vdusdt_balance > 0 else debt or 0
-    # TODO: if USDC debt is added later, sum here: stable_debt += vdusdc_balance
-
-    stable_debt_usd = stable_debt  # USDT is 1:1 USD
+    stable_debt = stable_borrow_principal
+    stable_debt_usd = debt if debt is not None and sum(stable_debt_components(raw).values()) > 0 else stable_debt
     net_stable = stable_lp - stable_debt_usd
     prev_realized_usd = (previous_snapshot or {}).get("cumulative_realized_fees_usd") or 0
     prev_realized_eth = (previous_snapshot or {}).get("cumulative_realized_fees_eth") or 0
@@ -1087,7 +1425,8 @@ def compute_snapshot(
         "ltv_pct": ltv_pct,
         "aweth_balance": aweth_balance,
         "awbtc_balance": awbtc_balance,
-        "vdusdt_balance": vdusdt_balance,
+        "vdusdt_balance": raw.get("vdusdt_balance"),
+        "vdusdc_balance": raw.get("vdusdc_balance"),
         "uni_positions": raw.get("uni_positions"),
         "uni_position_ids": raw.get("uni_position_ids"),
         "uni_active_position_ids": raw.get("uni_active_position_ids"),
@@ -1114,7 +1453,8 @@ def compute_snapshot(
         "correlated_liq_price_eth": correlated_liq_price_eth,
         "correlated_liq_price_btc": correlated_liq_price_btc,
         "eth_supply_apy": eth_supply_apy,
-        "usdt_borrow_apy": usdt_borrow_apy,
+        "usdt_borrow_apy": raw.get("usdt_borrow_apy"),
+        "usdc_borrow_apy": raw.get("usdc_borrow_apy"),
         "aave_daily_carry": aave_daily_carry,
         "aave_daily_supply_income": aave_daily_supply_income,
         "aave_daily_borrow_cost": aave_daily_borrow_cost,
@@ -1436,13 +1776,10 @@ def build_risk_alerts(snapshot: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def row_financing_carry(row: dict[str, Any]) -> float | None:
-    debt = row.get("vdusdt_balance")
-    if debt is None or debt <= 0:
-        debt = row.get("aave_debt")
-    borrow_apy = row.get("usdt_borrow_apy")
-    if debt is None or borrow_apy is None:
+    cost = weighted_stable_borrow_cost(row)
+    if cost is None:
         return None
-    return -(debt * (borrow_apy / 100) / 365)
+    return -cost
 
 
 def calc_fee_accounting_seed(history: list[dict[str, Any]]) -> dict[str, float]:
@@ -1585,18 +1922,51 @@ def enrich_active_farms(
     farm_history: list[dict[str, Any]],
     eth_price: float | None,
     btc_price: float | None,
+    current_farm_apy: float | None = None,
+    current_farm_apy_is_fallback: bool = False,
+    apy_7d: float | None = None,
+    apy_30d: float | None = None,
+    farm_apy_quality: str | None = None,
 ) -> list[dict[str, Any]]:
     enriched = []
     for farm in farms:
-        realized = sum_farm_history(farm_history, eth_price, btc_price, {str(farm.get("nft_id"))})
+        ledger_row = find_farm_history_row(farm_history, farm.get("nft_id"))
+        current_output_usd = (farm.get("position_value") or 0) + (farm.get("unclaimed_usd") or 0)
+        current_output_weth = (farm.get("weth_amount") or 0) + (farm.get("unclaimed_weth") or 0)
+        current_output_wbtc = (farm.get("wbtc_amount") or 0) + (farm.get("unclaimed_wbtc") or 0)
+        current_output_usdt = (farm.get("usdt_amount") or 0) + (farm.get("unclaimed_usdt") or 0)
+        current_output_usdc = (farm.get("usdc_amount") or 0) + (farm.get("unclaimed_usdc") or 0)
         enriched_farm = dict(farm)
-        enriched_farm["lifetime_weth"] = realized["weth"] + (farm.get("unclaimed_weth") or 0)
-        enriched_farm["lifetime_wbtc"] = realized["wbtc"] + (farm.get("unclaimed_wbtc") or 0)
-        enriched_farm["lifetime_usdt"] = realized["usdt"] + (farm.get("unclaimed_usdt") or 0)
-        enriched_farm["lifetime_usdc"] = realized["usdc"] + (farm.get("unclaimed_usdc") or 0)
-        enriched_farm["lifetime_usd"] = realized["usd"] + (farm.get("unclaimed_usd") or 0)
-        enriched_farm["realized_usd"] = realized["usd"]
-        enriched_farm["csv_rows"] = realized["rows"]
+        enriched_farm["ledger_row"] = ledger_row
+        enriched_farm["input_configured"] = ledger_row is not None
+        enriched_farm["stage"] = (ledger_row or {}).get("stage")
+        enriched_farm["input_usd"] = row_input_usd(ledger_row, eth_price, btc_price) if ledger_row else None
+        enriched_farm["current_output_usd"] = current_output_usd
+        enriched_farm["farm_result_usd"] = (
+            current_output_usd - enriched_farm["input_usd"]
+            if enriched_farm["input_usd"] is not None
+            else None
+        )
+        enriched_farm["eth_delta"] = (
+            current_output_weth - (ledger_row.get("input_weth") or 0)
+            if ledger_row
+            else None
+        )
+        enriched_farm["btc_delta"] = (
+            current_output_wbtc - (ledger_row.get("input_wbtc") or 0)
+            if ledger_row
+            else None
+        )
+        enriched_farm["stable_delta"] = (
+            (current_output_usdt + current_output_usdc)
+            - ((ledger_row.get("input_usdt") or 0) + (ledger_row.get("input_usdc") or 0))
+            if ledger_row
+            else None
+        )
+        enriched_farm["apy_24h"] = None if current_farm_apy_is_fallback else current_farm_apy
+        enriched_farm["apy_7d"] = apy_7d
+        enriched_farm["apy_30d"] = apy_30d
+        enriched_farm["apy_quality"] = farm_apy_quality or "N/A"
         enriched.append(enriched_farm)
     return enriched
 
@@ -1608,45 +1978,164 @@ def build_active_farm_cards(farms: list[dict[str, Any]]) -> str:
     cards = []
     for farm in farms:
         status_class = "green" if farm.get("in_range") else "red"
+        result_class = (
+            "green" if (farm.get("farm_result_usd") or 0) >= 0 else "red"
+            if farm.get("input_configured")
+            else ""
+        )
+        wbtc_detail = (
+            f'<div><span class="label">WBTC</span><strong>{number(farm.get("wbtc_amount"), 6)}</strong></div>'
+            if abs(farm.get("wbtc_amount") or 0) > 0.0000005
+            else ""
+        )
+        usdc_detail = (
+            f'<div><span class="label">USDC</span><strong>{number(farm.get("usdc_amount"), 2)}</strong></div>'
+            if abs(farm.get("usdc_amount") or 0) >= 0.005
+            else ""
+        )
         cards.append(f"""
       <div class="card farm-panel active-farm-card">
-        <h3>Position &middot; Uniswap NFT #{escape(str(farm.get("nft_id")))}</h3>
-        <div class="farm-split">
-          <div class="uni-grid">
-            <div class="label">Pair</div><div>{escape(farm.get("pair") or "Unknown")}</div>
-            <div class="label">Status</div><div class="{status_class}">{escape(farm.get("status") or "N/A")}</div>
-            <div class="label">Current price</div><div>{whole_money(farm.get("current_price"))}</div>
-            <div class="label">Range</div><div>{whole_money(farm.get("price_lower"))} - {whole_money(farm.get("price_upper"))}</div>
-            <div class="label">Position value</div><div>{money(farm.get("position_value"))}</div>
-          </div>
-          <div class="uni-grid">
-            <div class="label">WETH</div><div>{number(farm.get("weth_amount"), 6)}</div>
-            <div class="label">WBTC</div><div>{number(farm.get("wbtc_amount"), 6)}</div>
-            <div class="label">USDT</div><div>{number(farm.get("usdt_amount"), 2)}</div>
-            <div class="label">USDC</div><div>{number(farm.get("usdc_amount"), 2)}</div>
-            <div class="label">LP stable %</div><div>{percent(farm.get("stable_pct"), 1)}</div>
-          </div>
-        </div>
         <div class="range-visual">
           <div class="range-caption">{escape(farm.get("pair") or "Farm")} &middot; <span class="{status_class}">{escape(farm.get("status") or "N/A")}</span></div>
           <div class="range-labels"><span>{whole_money(farm.get("price_lower"))}</span><span>{whole_money(farm.get("price_upper"))}</span></div>
           <div class="range-bar" style="--range-position: {range_position_pct(farm):.2f}%"><span class="range-dot"></span></div>
           <div class="range-now">{whole_money(farm.get("current_price"))}</div>
         </div>
-        <div class="today-output">
-          <div class="label">Lifetime estimate</div>
-          <div class="farm-output-lines">
-            <div><span class="label">Total</span><strong>{money(farm.get("lifetime_usd"))}</strong></div>
-            <div><span class="label">WETH</span><strong>{number(farm.get("lifetime_weth"), 6)}</strong></div>
-            <div><span class="label">WBTC</span><strong>{number(farm.get("lifetime_wbtc"), 6)}</strong></div>
-            <div><span class="label">USDT</span><strong>{number(farm.get("lifetime_usdt"), 2)}</strong></div>
-            <div><span class="label">USDC</span><strong>{number(farm.get("lifetime_usdc"), 2)}</strong></div>
-            <div><span class="label">Current unclaimed</span><strong>{money(farm.get("unclaimed_usd"))}</strong></div>
-          </div>
+        <div class="farm-summary-strip">
+          <div><span class="label">Position value</span><strong>{money(farm.get("position_value"))}</strong></div>
+          <div><span class="label">Result</span><strong class="{result_class}">{signed_money(farm.get("farm_result_usd")) if farm.get("input_configured") else "Input not configured"}</strong></div>
+          <div><span class="label">7d APY</span><strong>{percent(farm.get("apy_7d"), 1)}</strong></div>
+          <div><span class="label">30d APY</span><strong>{percent(farm.get("apy_30d"), 1)}</strong></div>
+          <div><span class="label">LP stable %</span><strong>{percent(farm.get("stable_pct"), 1)}</strong></div>
         </div>
+        <details class="farm-details">
+          <summary>Details</summary>
+          <div class="farm-output-lines">
+            <div><span class="label">Stage</span><strong>{escape(farm.get("stage") or "Input not configured")}</strong></div>
+            <div><span class="label">NFT ID</span><strong>#{escape(str(farm.get("nft_id")))}</strong></div>
+            <div><span class="label">WETH</span><strong>{number(farm.get("weth_amount"), 6)}</strong></div>
+            {wbtc_detail}
+            <div><span class="label">USDT</span><strong>{number(farm.get("usdt_amount"), 2)}</strong></div>
+            {usdc_detail}
+            <div><span class="label">Input</span><strong>{money(farm.get("input_usd")) if farm.get("input_configured") else "Input not configured"}</strong></div>
+            <div><span class="label">Current value</span><strong>{money(farm.get("current_output_usd"))}</strong></div>
+            <div><span class="label">Result</span><strong class="{result_class}">{signed_money(farm.get("farm_result_usd")) if farm.get("input_configured") else "Input not configured"}</strong></div>
+            <div><span class="label">ETH delta</span><strong>{signed_asset(farm.get("eth_delta"), "WETH", 6) if farm.get("input_configured") else "Input not configured"}</strong></div>
+            <div><span class="label">BTC delta</span><strong>{signed_asset(farm.get("btc_delta"), "WBTC", 6) if farm.get("input_configured") else "Input not configured"}</strong></div>
+            <div><span class="label">Stable delta</span><strong>{signed_stable_delta(farm.get("stable_delta")) if farm.get("input_configured") else "Input not configured"}</strong></div>
+            <div><span class="label">Current unclaimed</span><strong>{money(farm.get("unclaimed_usd"))}</strong></div>
+            <div><span class="label">24h APY</span><strong>{percent(farm.get("apy_24h"), 1)}</strong></div>
+            <div><span class="label">Quality</span><strong>{escape(farm.get("apy_quality") or "N/A")}</strong></div>
+          </div>
+        </details>
       </div>
 """)
     return "\n".join(cards)
+
+
+def build_per_farm_ledger_section(
+    farm_history: list[dict[str, Any]],
+    active_farms: list[dict[str, Any]],
+    eth_price: float | None,
+    btc_price: float | None,
+) -> str:
+    rows = []
+    active_ids = {str(farm.get("nft_id") or "").strip().lstrip("#") for farm in active_farms}
+
+    for farm in active_farms:
+        nft_id = str(farm.get("nft_id") or "").strip().lstrip("#")
+        configured = farm.get("input_configured")
+        rows.append({
+            "nft_id": nft_id,
+            "pair": farm.get("pair") or "Unknown",
+            "stage": farm.get("stage") or "Input not configured",
+            "status": "active" if configured else "unconfigured live",
+            "status_class": "green" if configured else "amber",
+            "input": money(farm.get("input_usd")) if configured else "Input not configured",
+            "value_label": "Current Value",
+            "value": money(farm.get("current_output_usd")),
+            "result": signed_money(farm.get("farm_result_usd")) if configured else "Input not configured",
+            "eth_delta": signed_asset(farm.get("eth_delta"), "WETH", 6) if configured else "Input not configured",
+            "btc_delta": signed_asset(farm.get("btc_delta"), "WBTC", 6) if configured else "Input not configured",
+            "stable_delta": signed_stable_delta(farm.get("stable_delta")) if configured else "Input not configured",
+            "unclaimed": money(farm.get("unclaimed_usd")),
+            "notes": "Live now",
+        })
+
+    for row in farm_history:
+        nft_id = str(row.get("nft_id") or "").strip().lstrip("#")
+        status = (row.get("status") or "").lower()
+        if status == "active" and nft_id in active_ids:
+            continue
+        input_usd = row_input_usd(row, eth_price, btc_price)
+        output_usd = row_output_usd(row, eth_price, btc_price)
+        rows.append({
+            "nft_id": nft_id,
+            "pair": row.get("pair") or "Unknown",
+            "stage": row.get("stage") or "N/A",
+            "status": row.get("status") or "N/A",
+            "status_class": "blue" if status == "closed" else "amber",
+            "input": money(input_usd),
+            "value_label": "Final Output" if status == "closed" else "Value",
+            "value": money(output_usd),
+            "result": signed_money(output_usd - input_usd),
+            "eth_delta": signed_asset((row.get("output_weth") or 0) - (row.get("input_weth") or 0), "WETH", 6),
+            "btc_delta": signed_asset((row.get("output_wbtc") or 0) - (row.get("input_wbtc") or 0), "WBTC", 6),
+            "stable_delta": signed_stable_delta(farm_stable_delta(row)),
+            "unclaimed": "N/A",
+            "notes": row.get("notes") or "",
+        })
+
+    extra_rows = max(0, len(rows) - 1)
+    toggle_html = (
+        f'<button class="review-toggle" type="button" onclick="toggleExpandableTable(this)" data-count="{extra_rows}">Show all {len(rows)} rows</button>'
+        if extra_rows
+        else ""
+    )
+
+    if rows:
+        body = "\n".join(
+            f"""
+            <tr{(' class="ledger-extra-row"' if index > 0 else '')}>
+              <td>#{escape(str(row.get("nft_id") or ""))}</td>
+              <td>{escape(row.get("pair") or "Unknown")}</td>
+              <td>{escape(row.get("stage") or "N/A")}</td>
+              <td><span class="pill {escape(row.get("status_class") or "muted")}">{escape(row.get("status") or "N/A")}</span></td>
+              <td>{row.get("input")}</td>
+              <td><span class="value-label">{escape(row.get("value_label") or "Value")}</span>{row.get("value")}</td>
+              <td>{row.get("result")}</td>
+              <td>{row.get("eth_delta")}</td>
+              <td>{row.get("btc_delta")}</td>
+              <td>{row.get("stable_delta")}</td>
+              <td>{row.get("unclaimed")}</td>
+              <td>{escape(row.get("notes") or "")}</td>
+            </tr>"""
+            for index, row in enumerate(rows)
+        )
+    else:
+        body = """
+            <tr><td colspan="12" class="muted">No confirmed farm history or live active farms yet.</td></tr>"""
+
+    return f"""
+    <h2 class="section-title">PER-FARM LEDGER</h2>
+    <section class="card per-farm-ledger">
+      <div class="history-review-head">
+        <h2>Farm ledger</h2>
+        <div class="history-review-actions">
+          <div class="subvalue">Confirmed farm_history.csv rows plus current live active farms. Pending suggestions are excluded.</div>
+          {toggle_html}
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>NFT</th><th>Pair</th><th>Stage</th><th>Status</th><th>Input</th><th>Value</th><th>Result</th><th>WETH &Delta;</th><th>BTC &Delta;</th><th>Stable &Delta;</th><th>Unclaimed</th><th>Last seen / Notes</th></tr></thead>
+          <tbody>
+{body}
+          </tbody>
+        </table>
+      </div>
+    </section>
+"""
 
 
 def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) -> None:
@@ -1715,7 +2204,6 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     )
     risk_label, risk_class = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
     risk_display = risk_label.title()
-    carry_class = "green" if (snapshot.get("daily_financing_carry") or 0) >= 0 else "red"
     gas_row = ""
     if snapshot.get("gas_usd") is not None and snapshot.get("gas_usd") > 0:
         gas_row = f"""
@@ -1763,51 +2251,49 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     cumulative_financing_carry = chart_rows[-1]["cumulative_aave_carry"] if chart_rows else None
     cumulative_net_output = chart_rows[-1]["cumulative_net_output"] if chart_rows else None
     farm_history = load_farm_history()
-    active_nft_ids = parse_nft_ids(snapshot.get("uni_active_position_ids"))
-    history_lifetime = sum_farm_history(farm_history, snapshot.get("eth_price"), snapshot.get("btc_price"))
-    history_active = sum_farm_history(
-        farm_history,
-        snapshot.get("eth_price"),
-        snapshot.get("btc_price"),
-        active_nft_ids,
-    )
-    lifetime_weth_earned = history_lifetime["weth"] + (snapshot.get("uni_weth_fees") or 0)
-    lifetime_wbtc_earned = history_lifetime["wbtc"]
-    lifetime_usdt_earned = history_lifetime["usdt"] + (snapshot.get("uni_usdt_fees") or 0)
-    lifetime_usdc_earned = history_lifetime["usdc"]
-    if farm_history:
-        cumulative_lp_fees = history_lifetime["usd"] + (snapshot.get("uni_fees_unclaimed") or 0)
-        cumulative_net_output = (
-            cumulative_lp_fees + cumulative_financing_carry
-            if cumulative_financing_carry is not None
-            else cumulative_lp_fees
-        )
     active_farms = enrich_active_farms(
         snapshot.get("uni_active_farms") or [],
         farm_history,
         snapshot.get("eth_price"),
         snapshot.get("btc_price"),
+        snapshot.get("current_farm_apy"),
+        bool(snapshot.get("current_farm_apy_is_fallback")),
+        snapshot.get("apy_7d"),
+        snapshot.get("apy_30d"),
+        snapshot.get("apy_quality"),
     )
     active_farms_cards_html = build_active_farm_cards(active_farms)
     active_farms_value = sum(farm.get("position_value") or 0 for farm in active_farms)
     active_farms_unclaimed = sum(farm.get("unclaimed_usd") or 0 for farm in active_farms)
-    active_farms_lifetime = sum(farm.get("lifetime_usd") or 0 for farm in active_farms)
-    active_farms_weth = sum(farm.get("lifetime_weth") or 0 for farm in active_farms)
-    active_farms_wbtc = sum(farm.get("lifetime_wbtc") or 0 for farm in active_farms)
-    active_farms_usdt = sum(farm.get("lifetime_usdt") or 0 for farm in active_farms)
-    active_farms_usdc = sum(farm.get("lifetime_usdc") or 0 for farm in active_farms)
+    active_farms_configured = [farm for farm in active_farms if farm.get("input_configured")]
+    active_farms_result = sum(farm.get("farm_result_usd") or 0 for farm in active_farms_configured)
+    active_farms_current = sum(farm.get("current_output_usd") or 0 for farm in active_farms)
+    strategy_output = calc_strategy_output(
+        farm_history,
+        active_farms,
+        cumulative_financing_carry,
+        snapshot.get("eth_price"),
+        snapshot.get("btc_price"),
+    )
+    gross_farm_result_class = "green" if strategy_output["gross_result_usd"] >= 0 else "red"
+    lifetime_carry_class = "green" if strategy_output["financing_carry_usd"] >= 0 else "red"
+    net_strategy_class = "green" if strategy_output["net_result_usd"] >= 0 else "red"
+    farm_history_review = build_farm_history_review(
+        farm_history,
+        load_farm_history(FARM_HISTORY_SUGGESTIONS_FILE),
+        snapshot.get("uni_closed_farms") or [],
+        active_farms,
+        snapshot.get("eth_price"),
+        snapshot.get("btc_price"),
+    )
+    per_farm_ledger_html = build_per_farm_ledger_section(
+        farm_history,
+        active_farms,
+        snapshot.get("eth_price"),
+        snapshot.get("btc_price"),
+    )
+    farm_history_review_html = build_farm_history_review_section(farm_history_review)
     active_farm_lifetime = calc_active_farm_output(history, snapshot)
-    if farm_history:
-        active_farm_lifetime = {
-            "usd": history_active["usd"] + (snapshot.get("uni_fees_unclaimed") or 0),
-            "weth": history_active["weth"] + (snapshot.get("uni_weth_fees") or 0),
-            "wbtc": history_active["wbtc"],
-            "usdt": history_active["usdt"] + (snapshot.get("uni_usdt_fees") or 0),
-            "usdc": history_active["usdc"],
-            "realized_usd": history_active["usd"],
-            "unclaimed_usd": snapshot.get("uni_fees_unclaimed") or 0,
-            "csv_rows": history_active["rows"],
-        }
     active_farm_24h = calc_active_farm_last_24h(history, snapshot)
     active_farm_tracked_asset_usd = (
         (active_farm_lifetime.get("weth") or 0) * snapshot["eth_price"]
@@ -1954,8 +2440,13 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .strategy-output-value {{ margin-top: 4px; font-size: 24px; font-weight: 760; }}
     .farm-output-lines {{ display: grid; gap: 8px; margin-bottom: 16px; }}
     .farm-output-lines div {{ display: flex; justify-content: space-between; gap: 12px; }}
-    .today-output {{ border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px; }}
-    .range-visual {{ margin: 48px auto 8px; padding: 0 8px; width: 100%; max-width: 720px; }}
+    .range-visual {{ margin: 2px auto 16px; padding: 0 8px; width: 100%; max-width: 720px; }}
+    .farm-summary-strip {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }}
+    .farm-summary-strip div {{ min-width: 0; }}
+    .farm-summary-strip strong {{ display: block; margin-top: 2px; font-size: 15px; white-space: nowrap; }}
+    .farm-details {{ border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px; }}
+    .farm-details summary {{ color: var(--muted); cursor: pointer; font-size: 13px; font-weight: 700; }}
+    .farm-details .farm-output-lines {{ margin-top: 12px; margin-bottom: 0; }}
     .status-dot {{ display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 7px; background: var(--muted); }}
     .status-dot.green {{ background: var(--green); }}
     .status-dot.red {{ background: var(--red); }}
@@ -2009,6 +2500,39 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     th, td {{ padding: 13px 10px; border-bottom: 1px solid var(--border); text-align: left; }}
     th {{ color: var(--muted); font-size: 13px; font-weight: 600; }}
     tr:last-child td {{ border-bottom: 0; }}
+    .table-scroll {{ overflow-x: auto; }}
+    .history-review {{ margin-bottom: 20px; }}
+    .history-review-head {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 12px; }}
+    .history-review-actions {{ display: flex; align-items: center; gap: 12px; }}
+    .history-review h2 {{ margin-bottom: 0; }}
+    .history-review table {{ min-width: 980px; }}
+    .history-review th, .history-review td {{ padding: 10px 9px; white-space: nowrap; }}
+    .history-review td:last-child {{ min-width: 260px; color: var(--muted); font-size: 13px; }}
+    .history-review:not(.expanded) .review-extra-row {{ display: none; }}
+    .per-farm-ledger {{ margin-bottom: 20px; }}
+    .per-farm-ledger table {{ min-width: 1180px; }}
+    .per-farm-ledger th, .per-farm-ledger td {{ padding: 10px 9px; white-space: nowrap; }}
+    .per-farm-ledger td:last-child {{ min-width: 220px; color: var(--muted); font-size: 13px; }}
+    .per-farm-ledger:not(.expanded) .ledger-extra-row {{ display: none; }}
+    .history-review td:last-child, .per-farm-ledger td:last-child {{ white-space: normal; }}
+    .value-label {{ display: block; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; line-height: 1.1; opacity: 0.65; text-transform: uppercase; }}
+    .review-toggle {{
+      background: #262a33;
+      color: #e5e7eb;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 7px 10px;
+      white-space: nowrap;
+    }}
+    .review-toggle:hover {{ border-color: var(--green); color: var(--green); }}
+    .pill {{ display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; }}
+    .pill.green {{ border-color: var(--green); color: var(--green); background: rgba(52, 211, 153, 0.08); }}
+    .pill.amber {{ border-color: var(--amber); color: var(--amber); background: rgba(251, 191, 36, 0.08); }}
+    .pill.blue {{ border-color: var(--blue); color: var(--blue); background: rgba(129, 140, 248, 0.08); }}
     .two-col {{ display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }}
     .green {{ color: var(--green); }}
     .red {{ color: var(--red); }}
@@ -2018,7 +2542,9 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     footer {{ margin-top: 24px; color: var(--muted); font-size: 13px; text-align: center; }}
     @media (max-width: 820px) {{
       main {{ width: min(100% - 20px, 1180px); padding: 20px 0; }}
-      .grid, .grid.five, .grid.six, .grid.three, .health-grid, .active-farm, .active-farms-list, .farm-split, .banner, .two-col {{ grid-template-columns: 1fr; }}
+      .grid, .grid.five, .grid.six, .grid.three, .health-grid, .active-farm, .active-farms-list, .farm-split, .farm-summary-strip, .banner, .two-col {{ grid-template-columns: 1fr; }}
+      .history-review-head {{ display: block; }}
+      .history-review-actions {{ display: grid; gap: 10px; }}
       header {{ display: block; }}
       .refresh-btn {{ margin-top: 12px; }}
       h1 {{ font-size: 26px; }}
@@ -2041,7 +2567,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     <h2 class="section-title">SYSTEM HEALTH</h2>
     <section class="health-grid">
       <div class="card kpi"><div class="label">Health Factor</div><div class="value {banner_class}">{number(hf, 3)}</div><div class="subvalue">Target &ge;1.80 &middot; Floor 1.60</div></div>
-      <div class="card kpi"><div class="label">LP Stable Buffer</div><div class="value {stable_class}">{percent(snapshot.get("stable_buffer_pct"), 1)}</div><div class="subvalue">Currently counts USDT inside active LP only.</div></div>
+      <div class="card kpi"><div class="label">LP Stable Buffer</div><div class="value {stable_class}">{percent(snapshot.get("stable_buffer_pct"), 1)}</div><div class="subvalue">Counts USDT + USDC inside active LP.</div></div>
       <div class="card kpi"><div class="label">Borrow Usage</div><div class="value {borrow_usage_class}">{percent(snapshot.get("borrow_usage_pct"), 1)}</div><div class="subvalue">Capacity {whole_money(snapshot.get("max_borrow_capacity"))} &middot; Used {whole_money(snapshot.get("aave_debt"))}</div></div>
       <div class="card kpi"><div class="label">Current Stage</div><div class="value indigo">{escape(snapshot.get("current_stage") or CURRENT_STAGE)}</div><div class="subvalue">DeFi Path</div></div>
       <div class="card kpi"><div class="label">Risk State</div><div class="value {risk_state_color}">{escape(snapshot.get("risk_state", "N/A"))}</div><div class="subvalue">{escape(risk_state_note)}</div></div>
@@ -2053,9 +2579,9 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">Collateral Growth 30d</div><div class="value">{signed_percent(snapshot.get("coll_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Debt Growth 30d</div><div class="value">{signed_percent(snapshot.get("debt_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Net Flywheel Expansion</div><div class="value">{signed_percent(snapshot.get("flywheel_expansion"))}</div></div>
-      <div class="card kpi"><div class="label">Lifetime Strategy Output</div><div class="strategy-output-value green">{money(cumulative_lp_fees)}</div><div class="subvalue">All farms LP fees<br>WETH: {number(lifetime_weth_earned, 6)}<br>WBTC: {number(lifetime_wbtc_earned, 6)}<br>USDT: {number(lifetime_usdt_earned, 2)}<br>USDC: {number(lifetime_usdc_earned, 2)}<br>Estimated USD total: {money(cumulative_lp_fees)}</div></div>
-      <div class="card kpi"><div class="label">Lifetime Financing Carry</div><div class="strategy-output-value {carry_class}">{signed_money(cumulative_financing_carry)}</div><div class="subvalue">Estimated interest on borrowed stables<br>Net after carry: {money(cumulative_net_output)}</div></div>
-      <div class="card kpi"><div class="label">Borrow Room</div><div class="value indigo">{money(snapshot.get("remaining_borrow_room"))}</div><div class="subvalue">AAVE max LTV</div></div>
+      <div class="card kpi"><div class="label">Gross Farm Result</div><div class="strategy-output-value {gross_farm_result_class}">{signed_money(strategy_output["gross_result_usd"])}</div><div class="subvalue">Input: {money(strategy_output["input_usd"])}<br>Farm value: {money(strategy_output["gross_output_usd"])}<br>ETH delta: {signed_asset(strategy_output["eth_delta"], "WETH", 6)}<br>BTC delta: {signed_asset(strategy_output["btc_delta"], "WBTC", 6)}<br>{signed_stable_delta(strategy_output["stable_delta"])}</div></div>
+      <div class="card kpi"><div class="label">Financing Carry</div><div class="strategy-output-value {lifetime_carry_class}">{signed_money(strategy_output["financing_carry_usd"])}</div><div class="subvalue">Estimated stable debt interest<br>Negative means net borrowing cost</div></div>
+      <div class="card kpi"><div class="label">Net Strategy Output</div><div class="strategy-output-value {net_strategy_class}">{signed_money(strategy_output["net_result_usd"])}</div><div class="subvalue">Gross farm result plus financing carry<br>Rows: {strategy_output["closed_rows"]} closed + {strategy_output["active_configured_rows"]} active configured</div></div>
     </section>
 
     <h2 class="section-title">ACTIVE FARMS</h2>
@@ -2063,17 +2589,19 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">Active Farms</div><div class="value">{len(active_farms)}</div><div class="subvalue">Live Uniswap V3 NFTs</div></div>
       <div class="card kpi"><div class="label">Active Farm Value</div><div class="value">{money(active_farms_value)}</div><div class="subvalue">Current LP deployment</div></div>
       <div class="card kpi"><div class="label">Active Unclaimed</div><div class="value green">{money(active_farms_unclaimed)}</div><div class="subvalue">Fetched live from The Graph</div></div>
-      <div class="card kpi"><div class="label">Active Lifetime Output</div><div class="value green">{money(active_farms_lifetime)}</div><div class="subvalue">WETH {number(active_farms_weth, 6)} &middot; WBTC {number(active_farms_wbtc, 6)}<br>USDT {number(active_farms_usdt, 2)} &middot; USDC {number(active_farms_usdc, 2)}</div></div>
+      <div class="card kpi"><div class="label">Active Farm Result</div><div class="value {'green' if active_farms_result >= 0 else 'red'}">{signed_money(active_farms_result) if active_farms_configured else "Input not configured"}</div><div class="subvalue">Current value: {money(active_farms_current)}<br>Configured active rows: {len(active_farms_configured)}</div></div>
     </section>
     <section class="active-farms-list">
 {active_farms_cards_html}
     </section>
+{per_farm_ledger_html}
+{farm_history_review_html}
 
     <h2 class="section-title">UNIT ACCUMULATION</h2>
     <section class="grid three">
       <div class="card kpi"><div class="label">Total ETH Exposure</div><div class="value">{number(snapshot.get("total_eth_units"), 4)} ETH <span class="muted">({money(snapshot.get("total_eth_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("eth_aave"), 4)} permanent core collateral<br>LP exposure: {number(snapshot.get("eth_lp_amount"), 4)} active farm exposure, funded by borrowed stables<br>Wallet: {number(snapshot.get("eth_wallet"), 4)}</div></div>
       <div class="card kpi"><div class="label">Total BTC Exposure</div><div class="value">{number(snapshot.get("total_btc_units"), 6)} BTC <span class="muted">({money(snapshot.get("total_btc_value"))})</span></div><div class="subvalue">AAVE collateral: {number(snapshot.get("btc_aave"), 6)} permanent core collateral<br>LP BTC exposure: 0.000000 active farm exposure</div></div>
-      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}<br>Net stable: {money(snapshot.get("net_stable"))}</div></div>
+      <div class="card kpi"><div class="label">Net Stable Position</div><div class="value {net_stable_class}">Net stable: {money(snapshot.get("net_stable"))}</div><div class="subvalue">LP stables: {money(snapshot.get("stable_lp"))}<br>AAVE stable debt: -{money(snapshot.get("stable_debt_usd"))}<br>USDT debt: -{money(snapshot.get("vdusdt_balance"))}<br>USDC debt: -{money(snapshot.get("vdusdc_balance"))}</div></div>
     </section>
 {gas_row}
 
@@ -2083,7 +2611,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card"><h2>LTV Over Time</h2><div class="chart-wrap"><canvas id="ltvChart"></canvas></div></div>
       <div class="card"><h2>Farm APY Trend</h2><div class="chart-wrap"><canvas id="farmApyTrendChart"></canvas></div><div class="subvalue">APY calculated from daily LP fee yield. Zero values indicate no fee change that day.</div></div>
       <div class="card"><h2>Daily Yield Breakdown</h2><div class="chart-wrap"><canvas id="dailyYieldChart"></canvas></div></div>
-      <div class="card"><h2>Cumulative Farm Output</h2><div class="chart-wrap"><canvas id="cumulativeFarmOutputChart"></canvas></div></div>
+      <div class="card"><h2>Cumulative Fee Snapshot</h2><div class="chart-wrap"><canvas id="cumulativeFarmOutputChart"></canvas></div><div class="subvalue">Snapshot-derived fee/carry view. Deployment results come from farm_history.csv.</div></div>
 {unit_chart_html}
     </section>
 
@@ -2147,6 +2675,12 @@ config.py to enable this.</div>
     function formatPct(value) {{
         if (value === null || value === undefined || isNaN(value)) return '';
         return value.toFixed(1) + '%';
+    }}
+    function toggleExpandableTable(button) {{
+        const section = button.closest(".history-review, .per-farm-ledger");
+        const expanded = section.classList.toggle("expanded");
+        const count = button.dataset.count || "0";
+        button.textContent = expanded ? "Show one row" : "Show all " + (Number(count) + 1) + " rows";
     }}
 
     // Deduplicate rows by date — keep last snapshot per day
@@ -2309,6 +2843,7 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         ("aWETH balance", "aweth_balance", lambda: fetch_token_balance(AWETH, MAIN_WALLET, 18)),
         ("aWBTC balance", "awbtc_balance", lambda: fetch_token_balance(AWBTC, MAIN_WALLET, 8)),
         ("vdUSDT balance", "vdusdt_balance", lambda: fetch_token_balance(VDUSDT, MAIN_WALLET, 6)),
+        ("vdUSDC balance", "vdusdc_balance", lambda: fetch_token_balance(VDUSDC, MAIN_WALLET, 6)),
     ]
 
     aave_data, ok = safe_fetch("AAVE user data", lambda: fetch_aave_user_data(MAIN_WALLET))
@@ -2331,6 +2866,13 @@ def fetch_all() -> tuple[dict[str, Any], int]:
         raw["usdt_borrow_apy"] = usdt_rates["borrow_apy_pct"]
     else:
         raw["usdt_borrow_apy"] = None
+
+    usdc_rates, ok = safe_fetch("AAVE USDC reserve rates", lambda: fetch_aave_reserve_rates(USDC))
+    if ok:
+        successes += 1
+        raw["usdc_borrow_apy"] = usdc_rates["borrow_apy_pct"]
+    else:
+        raw["usdc_borrow_apy"] = None
 
     for label, key, fetcher in fetches:
         value, ok = safe_fetch(label, fetcher)
@@ -2417,6 +2959,9 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print("AAVE Rates:")
     print(f"  WETH supply APY:   {percent(snapshot.get('eth_supply_apy'), 2)}")
     print(f"  USDT borrow APY:   {percent(snapshot.get('usdt_borrow_apy'), 2)}")
+    print(f"  USDC borrow APY:   {percent(snapshot.get('usdc_borrow_apy'), 2)}")
+    print(f"  USDT debt:         {money(snapshot.get('vdusdt_balance'))}")
+    print(f"  USDC debt:         {money(snapshot.get('vdusdc_balance'))}")
     print(f"  Daily carry:       {money(snapshot.get('aave_daily_carry'))}")
     print("Yield today:")
     print(f"  LP fee yield:      {money(snapshot.get('uni_daily_fee_yield'))}")
@@ -2429,6 +2974,7 @@ def run_data_fetch(gas_eth: float = 0.0) -> bool:
     print(f"  Status:         {uni_status_text}")
     print(f"  WETH:           {number(snapshot.get('uni_weth_amount'), 4)} ETH")
     print(f"  USDT:           {number(snapshot.get('uni_usdt_amount'), 2)} USDT")
+    print(f"  USDC:           {number(snapshot.get('uni_usdc_amount'), 2)} USDC")
     print(f"  Position value: {money(snapshot.get('uni_position_value'))}")
     weth_fee_usd = (
         snapshot["uni_weth_fees"] * snapshot["eth_price"]
