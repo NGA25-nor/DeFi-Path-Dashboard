@@ -912,6 +912,53 @@ def sum_farm_history(
     }
 
 
+def calc_strategy_output(
+    farm_history: list[dict[str, Any]],
+    active_farms: list[dict[str, Any]],
+    financing_carry_usd: float | None,
+    eth_price: float | None,
+    btc_price: float | None,
+) -> dict[str, float]:
+    closed_farm_history = [
+        row for row in farm_history
+        if (row.get("status") or "").lower() != "active"
+    ]
+    closed_lifetime = sum_farm_history(closed_farm_history, eth_price, btc_price)
+    configured_active_farms = [
+        farm for farm in active_farms
+        if farm.get("input_configured")
+        and (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
+    ]
+    gross_input_usd = closed_lifetime["input_usd"] + sum(
+        farm.get("input_usd") or 0 for farm in configured_active_farms
+    )
+    gross_output_usd = closed_lifetime["output_usd"] + sum(
+        farm.get("current_output_usd") or 0 for farm in configured_active_farms
+    )
+    gross_result_usd = closed_lifetime["net_usd"] + sum(
+        farm.get("farm_result_usd") or 0 for farm in configured_active_farms
+    )
+    carry = financing_carry_usd or 0
+    return {
+        "input_usd": gross_input_usd,
+        "gross_output_usd": gross_output_usd,
+        "gross_result_usd": gross_result_usd,
+        "financing_carry_usd": carry,
+        "net_result_usd": gross_result_usd + carry,
+        "eth_delta": closed_lifetime["eth_delta"] + sum(
+            farm.get("eth_delta") or 0 for farm in configured_active_farms
+        ),
+        "btc_delta": closed_lifetime["btc_delta"] + sum(
+            farm.get("btc_delta") or 0 for farm in configured_active_farms
+        ),
+        "stable_delta": closed_lifetime["stable_delta"] + sum(
+            farm.get("stable_delta") or 0 for farm in configured_active_farms
+        ),
+        "closed_rows": closed_lifetime["rows"],
+        "active_configured_rows": len(configured_active_farms),
+    }
+
+
 def farm_history_row_usd(row: dict[str, Any], eth_price: float | None, btc_price: float | None) -> float:
     return row_output_usd(row, eth_price, btc_price)
 
@@ -1989,7 +2036,6 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     )
     risk_label, risk_class = liquidation_status(snapshot.get("correlated_liq_drop_pct"))
     risk_display = risk_label.title()
-    carry_class = "green" if (snapshot.get("daily_financing_carry") or 0) >= 0 else "red"
     gas_row = ""
     if snapshot.get("gas_usd") is not None and snapshot.get("gas_usd") > 0:
         gas_row = f"""
@@ -2037,11 +2083,6 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     cumulative_financing_carry = chart_rows[-1]["cumulative_aave_carry"] if chart_rows else None
     cumulative_net_output = chart_rows[-1]["cumulative_net_output"] if chart_rows else None
     farm_history = load_farm_history()
-    closed_farm_history = [
-        row for row in farm_history
-        if (row.get("status") or "").lower() != "active"
-    ]
-    history_lifetime = sum_farm_history(closed_farm_history, snapshot.get("eth_price"), snapshot.get("btc_price"))
     active_farms = enrich_active_farms(
         snapshot.get("uni_active_farms") or [],
         farm_history,
@@ -2054,36 +2095,16 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     active_farms_configured = [farm for farm in active_farms if farm.get("input_configured")]
     active_farms_result = sum(farm.get("farm_result_usd") or 0 for farm in active_farms_configured)
     active_farms_current = sum(farm.get("current_output_usd") or 0 for farm in active_farms)
-    lifetime_strategy_input = history_lifetime["input_usd"] + sum(
-        farm.get("input_usd") or 0
-        for farm in active_farms_configured
-        if (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
+    strategy_output = calc_strategy_output(
+        farm_history,
+        active_farms,
+        cumulative_financing_carry,
+        snapshot.get("eth_price"),
+        snapshot.get("btc_price"),
     )
-    lifetime_current_output = history_lifetime["output_usd"] + sum(
-        farm.get("current_output_usd") or 0
-        for farm in active_farms_configured
-        if (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
-    )
-    lifetime_strategy_result = history_lifetime["net_usd"] + sum(
-        farm.get("farm_result_usd") or 0
-        for farm in active_farms_configured
-        if (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
-    )
-    lifetime_eth_delta = history_lifetime["eth_delta"] + sum(
-        farm.get("eth_delta") or 0
-        for farm in active_farms_configured
-        if (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
-    )
-    lifetime_btc_delta = history_lifetime["btc_delta"] + sum(
-        farm.get("btc_delta") or 0
-        for farm in active_farms_configured
-        if (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
-    )
-    lifetime_stable_delta = history_lifetime["stable_delta"] + sum(
-        farm.get("stable_delta") or 0
-        for farm in active_farms_configured
-        if (farm.get("ledger_row") or {}).get("status", "").lower() == "active"
-    )
+    gross_farm_result_class = "green" if strategy_output["gross_result_usd"] >= 0 else "red"
+    lifetime_carry_class = "green" if strategy_output["financing_carry_usd"] >= 0 else "red"
+    net_strategy_class = "green" if strategy_output["net_result_usd"] >= 0 else "red"
     farm_history_review = build_farm_history_review(
         farm_history,
         load_farm_history(FARM_HISTORY_SUGGESTIONS_FILE),
@@ -2365,9 +2386,9 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       <div class="card kpi"><div class="label">Collateral Growth 30d</div><div class="value">{signed_percent(snapshot.get("coll_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Debt Growth 30d</div><div class="value">{signed_percent(snapshot.get("debt_growth_30d"))}</div></div>
       <div class="card kpi"><div class="label">Net Flywheel Expansion</div><div class="value">{signed_percent(snapshot.get("flywheel_expansion"))}</div></div>
-      <div class="card kpi"><div class="label">Lifetime Strategy Result</div><div class="strategy-output-value {'green' if lifetime_strategy_result >= 0 else 'red'}">{signed_money(lifetime_strategy_result)}</div><div class="subvalue">Input: {money(lifetime_strategy_input)}<br>Output/current: {money(lifetime_current_output)}<br>ETH delta: {signed_asset(lifetime_eth_delta, "WETH", 6)}<br>BTC delta: {signed_asset(lifetime_btc_delta, "WBTC", 6)}<br>Stable delta: {signed_asset(lifetime_stable_delta, "stables", 2)}</div></div>
-      <div class="card kpi"><div class="label">Lifetime Financing Carry</div><div class="strategy-output-value {carry_class}">{signed_money(cumulative_financing_carry)}</div><div class="subvalue">Estimated interest on borrowed stables<br>Shown separately from farm result</div></div>
-      <div class="card kpi"><div class="label">Borrow Room</div><div class="value indigo">{money(snapshot.get("remaining_borrow_room"))}</div><div class="subvalue">AAVE max LTV</div></div>
+      <div class="card kpi"><div class="label">Gross Farm Result</div><div class="strategy-output-value {gross_farm_result_class}">{signed_money(strategy_output["gross_result_usd"])}</div><div class="subvalue">Input: {money(strategy_output["input_usd"])}<br>Output/current: {money(strategy_output["gross_output_usd"])}<br>ETH delta: {signed_asset(strategy_output["eth_delta"], "WETH", 6)}<br>BTC delta: {signed_asset(strategy_output["btc_delta"], "WBTC", 6)}<br>Stable delta: {signed_asset(strategy_output["stable_delta"], "stables", 2)}</div></div>
+      <div class="card kpi"><div class="label">Financing Carry</div><div class="strategy-output-value {lifetime_carry_class}">{signed_money(strategy_output["financing_carry_usd"])}</div><div class="subvalue">Estimated stable debt interest<br>Negative means net borrowing cost</div></div>
+      <div class="card kpi"><div class="label">Net Strategy Output</div><div class="strategy-output-value {net_strategy_class}">{signed_money(strategy_output["net_result_usd"])}</div><div class="subvalue">Gross farm result plus financing carry<br>Rows: {strategy_output["closed_rows"]} closed + {strategy_output["active_configured_rows"]} active configured</div></div>
     </section>
 
     <h2 class="section-title">ACTIVE FARMS</h2>

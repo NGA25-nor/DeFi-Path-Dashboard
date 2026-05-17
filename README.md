@@ -151,9 +151,9 @@ Live Uniswap V3 position + output view. If multiple farms are active, each NFT i
 - Collateral growth 30d
 - Debt growth 30d
 - Net flywheel expansion (collateral growth − debt growth)
-- Lifetime Strategy Result from the farm ledger: input, output/current, net result, ETH delta, BTC delta, stable delta
-- Lifetime Financing Carry as estimated interest on borrowed stables
-- Borrow Room (remaining capacity from AAVE)
+- Gross Farm Result from the farm ledger before financing: input, output/current, result, ETH delta, BTC delta, stable delta
+- Financing Carry as estimated stable debt interest; negative means net borrowing cost
+- Net Strategy Output = Gross Farm Result + Financing Carry
 
 ### Unit Accumulation
 - Total ETH exposure (AAVE + wallet + LP)
