@@ -2,7 +2,7 @@
 
 A local, privacy-first Capital OS DeFi dashboard for AAVE V3 + Uniswap V3 positions on Ethereum mainnet.
 
-Runs entirely on your own machine. No server. No cloud. No subscription.
+Runs on your own machine with a local browser dashboard. No hosted server, no cloud account, no subscription, and no private keys.
 
 ---
 
@@ -12,6 +12,7 @@ Runs entirely on your own machine. No server. No cloud. No subscription.
 - Mac or Linux
 - Python 3.10+
 - Ethereum wallet with AAVE V3 and/or Uniswap V3 positions
+- The Graph API key for live Uniswap fee tracking
 
 ```bash
 # 1. Clone the repo
@@ -25,6 +26,10 @@ pip install requests
 
 # 3. Add your wallet addresses
 cp config.example.py config.py
+```
+
+Open `config.py` in your editor. On macOS you can use:
+```bash
 open -e config.py
 ```
 
@@ -44,7 +49,7 @@ chmod +x start.command
 python3 tracker.py
 ```
 
-Dashboard opens at `http://localhost:5050`. That's it. 🎉
+Dashboard opens at `http://localhost:5050`. If that port is busy, the tracker tries the next available port.
 
 On first run, `tracker.py` automatically creates the local SQLite database at `data/portfolio.db`.
 
@@ -76,6 +81,8 @@ Press `Ctrl+C` to stop the server.
 
 Optional, but recommended if you want operator-grade deployment accounting.
 
+The live chain data can tell what an LP NFT is worth now. It cannot know what you originally deployed into that farm. `data/farm_history.csv` is the manual ledger that fills that gap.
+
 Create your own file from the example:
 ```bash
 cp data/farm_history.example.csv data/farm_history.csv
@@ -93,12 +100,19 @@ This file is an operator ledger, not tax accounting:
 - Input = what was deployed when the farm started.
 - Output = what was received when the farm closed, collected, or was manually recorded.
 - Result = output minus input.
+- Stables = USDT + USDC.
 
 For active farms, seed the input fields manually. The dashboard uses the live LP value plus current unclaimed fees as the current output estimate.
 
 If `data/farm_history.csv` is missing, the dashboard still runs and uses live/snapshot data only.
 
 Do not enter current unclaimed fees for active farms here; those are fetched live.
+
+Recommended workflow:
+1. Add a row when you deploy a new farm and mark it `active`.
+2. Keep the input fields as the original deployment amounts.
+3. When the farm is closed, update `status` to `closed` and fill the output fields with the final received amounts.
+4. Leave current unclaimed fees out of the CSV; they are fetched live.
 
 When a farm appears closed and is not already in your manual history, the tracker may create:
 ```text
@@ -140,20 +154,36 @@ Appear only when triggered — calm and direct:
 
 ### Active Farms
 Live Uniswap V3 position + output view. If multiple farms are active, each NFT is shown separately:
-- Pair, status, current price, range, position value
-- Current / 7d / 30d farm APY
-- Active farm lifetime output estimate by WETH/WBTC/USDT/USDC
-- Last 24h LP fees, token fees, and estimated financing carry
+- Pair, status, current price range, and position value
+- 24h / 7d / 30d farm APY and APY quality
+- Active farm input, current value, result, and WETH/WBTC/stable deltas
 - Current unclaimed fees
-- ETH/USDT composition and range bar
+- WETH/WBTC/USDT/USDC composition and LP stable %
+- Range bar
 
 ### Flywheel Strength
 - Collateral growth 30d
 - Debt growth 30d
 - Net flywheel expansion (collateral growth − debt growth)
-- Gross Farm Result from the farm ledger before financing: input, output/current, result, ETH delta, BTC delta, stable delta
+- Gross Farm Result from the farm ledger before financing: input, farm value, result, ETH delta, BTC delta, stable delta
 - Financing Carry as estimated stable debt interest; negative means net borrowing cost
 - Net Strategy Output = Gross Farm Result + Financing Carry
+
+### Per-Farm Ledger
+Confirmed farm accounting in one table:
+- Live active farms, using current LP value plus unclaimed fees
+- Confirmed `data/farm_history.csv` rows
+- Input, current/final value, result, WETH delta, BTC delta, stable delta, unclaimed fees, and notes
+
+Pending suggestions are excluded from this table until copied into `data/farm_history.csv`.
+
+### Farm History Summary and Review Queue
+- Confirmed Rows = rows currently counted from `data/farm_history.csv`
+- Pending Suggestions = rows waiting in `data/farm_history_suggestions.csv`
+- Detected Closed = closed NFTs seen live but not yet in the manual ledger or suggestions
+- Confirmed Result = confirmed farm result from the reviewed ledger
+
+The Review Queue shows helper rows only. It is there to make closed farms easier to review before adding them to the manual ledger.
 
 ### Unit Accumulation
 - Total ETH exposure (AAVE + wallet + LP)
@@ -171,7 +201,7 @@ The Net Stable Position card also shows the AAVE stable debt split by USDT and U
 6. Unit Accumulation Over Time (ETH + BTC)
 
 ### Strategy vs HODL
-Placeholder — configure baseline in `config.py` to enable.
+Placeholder only. Baseline fields are documented in `config.example.py`, but the current tracker does not calculate a Strategy vs HODL benchmark yet.
 
 ---
 
@@ -183,7 +213,8 @@ LP_WALLET      = "0x..."         # wallet with Uniswap LP (can be same as MAIN)
 GRAPH_API_KEY  = "..."           # The Graph API key for unclaimed fee tracking
 CURRENT_STAGE  = "Stage 1"       # DeFi Path stage — update manually
 
-# Optional — enable Strategy vs HODL benchmark
+# Optional — future Strategy vs HODL benchmark inputs.
+# These are not used by the current tracker yet.
 # BASELINE_ETH     = 0.0
 # BASELINE_BTC     = 0.0
 # BASELINE_STABLES = 0.0
@@ -238,6 +269,8 @@ All calls are **read-only**. No private keys. No transactions.
 - Farm APY = daily fee yield / LP value × 365
 - Farm APY fallback = 7d average when today's yield is $0
 - Flywheel expansion = collateral growth % − debt growth %
+- Gross Farm Result = confirmed closed farm result + configured active farm current result
+- Net Strategy Output = Gross Farm Result + Financing Carry
 
 ---
 
@@ -246,6 +279,7 @@ All calls are **read-only**. No private keys. No transactions.
 - **Read-only** — no private keys, no seed phrases, no transactions
 - **Local only** — all data stays on your machine
 - `config.py` never pushed to GitHub
+- `data/farm_history.csv` and `data/farm_history_suggestions.csv` never pushed to GitHub
 - Only outbound calls: RPC reads + The Graph API
 
 ---
@@ -291,6 +325,12 @@ chmod +x start.command
 
 **Unclaimed fees show $0**
 Check that `GRAPH_API_KEY` is set in `config.py`. Get a free key at thegraph.com/studio.
+
+**Active Farm Result says `Input not configured`**
+Add that NFT to `data/farm_history.csv` with `status` set to `active` and fill the input fields with the original deployment amounts.
+
+**A closed farm appears in the Review Queue**
+Inspect `data/farm_history_suggestions.csv`. If the row is correct, copy it into `data/farm_history.csv`, fill any missing input fields, and keep it as the confirmed ledger row.
 
 **Dashboard not loading**
 `tracker.py` must be running. If port 5050 is busy it tries 5051, 5052 automatically.
