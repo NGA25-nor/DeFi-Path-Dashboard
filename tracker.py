@@ -1914,7 +1914,12 @@ def range_position_pct(farm: dict[str, Any]) -> float:
     current = farm.get("current_price")
     if None in (lower, upper, current) or upper == lower:
         return 50.0
-    return max(0.0, min(100.0, ((current - lower) / (upper - lower)) * 100))
+    if current < lower:
+        return 2.0
+    if current > upper:
+        return 98.0
+    in_range_pct = (current - lower) / (upper - lower)
+    return 10.0 + max(0.0, min(1.0, in_range_pct)) * 80.0
 
 
 def enrich_active_farms(
@@ -1995,11 +2000,19 @@ def build_active_farm_cards(farms: list[dict[str, Any]]) -> str:
         )
         cards.append(f"""
       <div class="card farm-panel active-farm-card">
+        <div class="eth-now-box">
+          <div class="eth-now-label">ETH NOW</div>
+          <div class="eth-now-value">{whole_money(farm.get("current_price"))}</div>
+        </div>
         <div class="range-visual">
           <div class="range-caption">{escape(farm.get("pair") or "Farm")} &middot; <span class="{status_class}">{escape(farm.get("status") or "N/A")}</span></div>
           <div class="range-labels"><span>{whole_money(farm.get("price_lower"))}</span><span>{whole_money(farm.get("price_upper"))}</span></div>
-          <div class="range-bar" style="--range-position: {range_position_pct(farm):.2f}%"><span class="range-dot"></span></div>
-          <div class="range-now">{whole_money(farm.get("current_price"))}</div>
+          <div class="range-bar" style="--range-position: {range_position_pct(farm):.2f}%">
+            <span class="range-marker">
+              <span class="range-now">{whole_money(farm.get("current_price"))}</span>
+              <span class="range-dot"></span>
+            </span>
+          </div>
         </div>
         <div class="farm-summary-strip">
           <div><span class="label">Position value</span><strong>{money(farm.get("position_value"))}</strong></div>
@@ -2432,7 +2445,21 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .uni-grid {{ display: grid; grid-template-columns: 160px 1fr; gap: 9px 14px; }}
     .active-farm {{ display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 20px; }}
     .active-farms-list {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }}
-    .active-farm-card {{ min-height: 0; }}
+    .active-farm-card {{ min-height: 0; position: relative; }}
+    .eth-now-box {{
+      position: absolute;
+      right: 14px;
+      top: 14px;
+      min-width: 116px;
+      border: 2px solid var(--green);
+      border-radius: 8px;
+      padding: 8px 12px 9px;
+      text-align: center;
+      background: rgba(15, 17, 21, 0.72);
+      box-shadow: 0 0 18px rgba(52, 211, 153, 0.12);
+    }}
+    .eth-now-label {{ color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: 0.32em; line-height: 1; }}
+    .eth-now-value {{ margin-top: 6px; color: var(--text); font-size: 22px; font-weight: 820; line-height: 1; }}
     .farm-panel {{ min-width: 0; }}
     .farm-panel h3 {{ margin: 0 0 12px; font-size: 15px; }}
     .farm-split {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
@@ -2454,24 +2481,34 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
     .range-bar {{
       position: relative;
       height: 34px;
-      margin: 28px 0 40px;
+      margin: 38px 0 34px;
       border-radius: 999px;
       background: linear-gradient(90deg, var(--red) 0 10%, var(--green) 10% 90%, var(--red) 90% 100%);
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
     }}
-    .range-dot {{
+    .range-marker {{
       position: absolute;
       left: var(--range-position);
       top: 50%;
+      height: 102px;
+      transform: translate(-50%, -50%);
+      width: 2px;
+      background: var(--green);
+      z-index: 1;
+    }}
+    .range-dot {{
+      position: absolute;
+      left: 50%;
+      top: 50%;
       width: 40px;
       height: 40px;
-      border: 3px solid #ffffff;
+      border: 3px solid var(--green);
       border-radius: 999px;
       background: var(--card);
       transform: translate(-50%, -50%);
-      box-shadow: 0 0 0 2px rgba(15, 17, 21, 0.85);
+      box-shadow: 0 0 0 3px rgba(15, 17, 21, 0.85), 0 0 18px rgba(52, 211, 153, 0.32);
     }}
-    .range-now {{ text-align: center; color: var(--text); font-weight: 700; }}
+    .range-now {{ position: absolute; bottom: calc(100% - 16px); left: 50%; color: var(--green); font-size: 13px; font-weight: 800; transform: translateX(-50%); white-space: nowrap; }}
     .range-caption {{ margin-top: 22px; color: var(--muted); font-weight: 700; }}
     .gas-row {{
       margin: -8px 0 20px;
@@ -2546,6 +2583,7 @@ def generate_dashboard(snapshot: dict[str, Any], history: list[dict[str, Any]]) 
       .history-review-head {{ display: block; }}
       .history-review-actions {{ display: grid; gap: 10px; }}
       header {{ display: block; }}
+      .eth-now-box {{ position: static; margin: 0 0 14px auto; }}
       .refresh-btn {{ margin-top: 12px; }}
       h1 {{ font-size: 26px; }}
       .chart-wrap {{ height: 280px; }}
